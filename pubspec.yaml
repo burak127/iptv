@@ -1,0 +1,72 @@
+name: iptv_player
+description: "Cross-platform IPTV player for Android, Android TV and Web (M3U + Xtream Codes)."
+publish_to: 'none'
+version: 0.2.0+2
+
+environment:
+  # Flutter 3.27+ (Dart 3.6+) — required for Color.withValues(...).
+  sdk: '>=3.6.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Robust player engine (libmpv) that copes with real-world IPTV streams:
+  # HLS / live / TS / odd codecs. Works on Android, Android TV, Windows and Web.
+  media_kit: ^1.1.11
+  media_kit_video: ^1.2.5
+  media_kit_libs_video: ^1.0.5
+
+  # Networking for M3U fetch + Xtream Codes API.
+  http: ^1.2.2
+
+  # Persist saved sources / favorites / resume locally.
+  shared_preferences: ^2.3.2
+
+  # On-disk catalog cache location (native platforms).
+  path_provider: ^2.1.5
+
+  # Disk + memory cached, downscaled channel logos / posters.
+  cached_network_image: ^3.4.1
+
+  # Hash the parental-control PIN.
+  crypto: ^3.0.6
+
+  # Keep the screen awake during playback.
+  wakelock_plus: ^1.2.8
+
+  # Save finished downloads into the device gallery (Videos/Movies) so they
+  # show up in Photos/Videos/Files. Native only (Android/iOS).
+  gal: ^2.3.1
+
+  # QR code for the "add source from phone" pairing flow.
+  qr_flutter: ^4.1.0
+
+  # True OS-level fullscreen for the player on desktop (Windows/macOS/Linux) —
+  # Flutter's own SystemChrome immersive modes only apply to Android.
+  window_manager: ^0.4.3
+
+  # Lightweight state management.
+  provider: ^6.1.2
+
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+  flutter_launcher_icons: ^0.14.3
+
+flutter:
+  uses-material-design: true
+
+flutter_launcher_icons:
+  android: true
+  image_path: "assets/icon/app_icon.png"
+  adaptive_icon_background: "#12203A"
+  adaptive_icon_foreground: "assets/icon/app_icon_foreground.png"
+  web:
+    generate: true
+    image_path: "assets/icon/app_icon.png"
+    background_color: "#0E1116"
+    theme_color: "#12203A"

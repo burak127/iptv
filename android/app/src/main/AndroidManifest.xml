@@ -1,0 +1,129 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Streaming needs the network. -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+
+    <!-- Optional auto-start-on-boot (grandparent kiosk mode). Android 10+
+         blocks a BroadcastReceiver from starting an Activity directly
+         (confirmed on a real Android 14 box: "Background activity launch
+         blocked ... callingUidProcState: RECEIVER"); these two additionally
+         let BootReceiver fall back to a full-screen-intent notification,
+         the OS-blessed exception to that restriction. POST_NOTIFICATIONS is
+         also a runtime permission on API 33+; requested from Settings when
+         the user turns the toggle on (see MainActivity.kt). -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT"/>
+    <!-- "Display over other apps" is a documented exemption from Android 10+'s
+         background-activity-launch block; when the user grants it (Settings,
+         special app access, or adb appops), BootReceiver can start the app
+         DIRECTLY at boot even though it's a background receiver. This is the
+         only reliable boot-autostart path on boxes whose stock launcher can't
+         be replaced (Google TV certification locks HOME via filter priority,
+         and full-screen-intent notifications don't fire while the device is
+         unlocked+interactive, which a TV box always is right after boot).
+         Declaring it here does NOT grant anything by itself. -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+
+    <!-- Saving finished downloads into the device gallery (gal). -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="29"/>
+    <uses-permission android:name="android.permission.ACCESS_MEDIA_LOCATION"/>
+
+    <!-- Android TV: advertise leanback support, and make touchscreen optional
+         so the app is installable/visible on TV boxes without a touch screen. -->
+    <uses-feature
+        android:name="android.software.leanback"
+        android:required="false"/>
+    <uses-feature
+        android:name="android.hardware.touchscreen"
+        android:required="false"/>
+
+    <application
+        android:label="IPTV Player"
+        android:name="${applicationName}"
+        android:icon="@mipmap/ic_launcher"
+        android:banner="@drawable/tv_banner"
+        android:usesCleartextTraffic="true">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:supportsPictureInPicture="true"
+            android:taskAffinity=""
+            android:theme="@style/LaunchTheme"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize">
+            <meta-data
+                android:name="io.flutter.embedding.android.NormalTheme"
+                android:resource="@style/NormalTheme"/>
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+                <!-- This category makes the app show up in the Android TV
+                     home screen launcher. -->
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER"/>
+            </intent-filter>
+        </activity>
+
+        <!-- Optional: lets the box use this app AS the home screen, so it opens
+             on every boot / HOME press (bulletproof grandparent kiosk). DISABLED
+             by default: a static, always-on HOME capability would make every
+             install (phones included) a home-launcher candidate, risking a
+             non-technical user accidentally setting it as their permanent home
+             screen with no easy way back. MainActivity flips this component on
+             at runtime (PackageManager.setComponentEnabledSetting) only when the
+             user explicitly opts in from Settings, and only on a TV device. -->
+        <activity-alias
+            android:name=".HomeAlias"
+            android:targetActivity=".MainActivity"
+            android:enabled="false"
+            android:exported="true">
+            <!-- NOTE: android:priority does NOT work here. A high priority was
+                 tried (to out-rank the Strong HY4600's stock Google TV launcher,
+                 whose HOME filter is priority=2) but Android silently CLAMPS
+                 intent-filter priority to 0 for non-privileged apps — verified
+                 on-device (dumpsys showed no priority on this filter). Combined
+                 with the vendor ROM force-re-enabling the certified launcher on
+                 every boot and Android 14 blocking receiver-based background
+                 activity launches, there is NO non-root way to auto-open this
+                 app at boot on a Google-TV-certified box. This alias is kept for
+                 the plain opt-in "make me the home app" path, which still works
+                 on non-certified / AOSP-style TV boxes. -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.HOME"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+            </intent-filter>
+        </activity-alias>
+        <!-- Impeller (Vulkan) is the default renderer. Forcing Skia here was a
+             wrong call: it didn't fix the Chromecast (direct mediacodec_embed
+             did) and it made the video-texture composite SLOWER on newer Amlogic
+             4K boxes (Strong HY4600) whose Mali GPU handles Vulkan well. Left on
+             the default so each GPU uses its fast path. -->
+        <meta-data
+            android:name="flutterEmbedding"
+            android:value="2"/>
+
+        <!-- Auto-start on boot (gated at runtime by the user's setting). -->
+        <receiver
+            android:name=".BootReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED"/>
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED"/>
+                <action android:name="android.intent.action.QUICKBOOT_POWERON"/>
+            </intent-filter>
+        </receiver>
+    </application>
+
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.PROCESS_TEXT"/>
+            <data android:mimeType="text/plain"/>
+        </intent>
+    </queries>
+</manifest>

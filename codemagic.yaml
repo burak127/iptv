@@ -1,0 +1,45 @@
+# Codemagic build recipe for producing an UNSIGNED iOS .ipa that can be
+# sideloaded onto an iPhone with AltStore / Sideloadly using a FREE Apple ID.
+#
+# Why unsigned: sideload tools re-sign the app themselves with your free Apple
+# ID on your Windows PC, so Codemagic must NOT sign it (signing here would need
+# a paid Apple Developer account — exactly what this route avoids).
+#
+# How to use:
+#  1. Push this repo to GitHub/GitLab (or upload it in the Codemagic UI).
+#  2. On codemagic.io (free tier is enough), add the app and pick the
+#     "ios-sideload-unsigned" workflow below.
+#  3. Start a build. When it finishes, download the .ipa artifact.
+#  4. On your Windows PC, open Sideloadly (or AltStore), plug in the iPhone,
+#     sign in with your free Apple ID, drag in the .ipa, and install.
+#     (Free Apple ID signatures last 7 days; AltStore can auto-refresh them.)
+
+workflows:
+  ios-sideload-unsigned:
+    name: iOS unsigned IPA (sideload)
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      flutter: stable
+      xcode: latest
+      cocoapods: default
+    scripts:
+      - name: Flutter pub get
+        script: flutter pub get
+      - name: Install CocoaPods dependencies
+        script: cd ios && pod install
+      - name: Build unsigned iOS app
+        # --no-codesign: produce Runner.app without any signing identity.
+        script: flutter build ios --release --no-codesign
+      - name: Package Runner.app into an unsigned .ipa
+        script: |
+          set -e
+          cd build/ios/iphoneos
+          mkdir -p Payload
+          cp -R Runner.app Payload/
+          zip -r9 iptv_player-unsigned.ipa Payload
+          rm -rf Payload
+    artifacts:
+      # Download this from the Codemagic build page, then feed it to
+      # Sideloadly / AltStore on your PC.
+      - build/ios/iphoneos/*.ipa
