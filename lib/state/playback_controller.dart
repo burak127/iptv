@@ -582,7 +582,14 @@ class PlaybackController extends ChangeNotifier {
     final platform = _player.platform;
     if (platform is NativePlayer) {
       try {
-        await platform.setProperty(name, value);
+        // Dynamic dispatch: NativePlayer.setProperty only exists on the
+        // native/FFI (libmpv) backend. media_kit's WEB build ships a
+        // NativePlayer type WITHOUT this method, so a direct call fails to
+        // compile for web — the web player uses an HTML <video> element and
+        // has no mpv properties to set. The `is NativePlayer` guard already
+        // means this line is never reached on web at runtime; the cast just
+        // lets it compile there too.
+        await (platform as dynamic).setProperty(name, value);
       } catch (_) {/* property not available on this backend */}
     }
   }
