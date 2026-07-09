@@ -31,6 +31,34 @@ workflows:
       - name: Build unsigned iOS app
         # --no-codesign: produce Runner.app without any signing identity.
         script: flutter build ios --release --no-codesign
+      - name: Strip code signatures for AltStore compatibility
+        # WHY: On Apple-Silicon build machines (this runner is an M2 Mac) the
+        # linker stamps every Mach-O with an "ad-hoc / linker-signed" signature
+        # even under --no-codesign. AltStore's bundled `ldid` cannot parse that
+        # newer signature format and aborts with:
+        #   ldid.cpp(1461): _assert(): end >= size - 0x10
+        # (Confirmed on AltStore issues #1660 / #1034 — Sideloadly/Esign work
+        #  because they use a different signer.) Removing the existing signature
+        # entirely gives ldid a clean binary to sign from scratch with the free
+        # Apple ID, sidestepping the parse assert. AltStore re-signs the app and
+        # ALL nested frameworks at install time, so shipping them unsigned here
+        # is correct.
+        script: |
+          set -e
+          APP="build/ios/iphoneos/Runner.app"
+          echo "Stripping signatures from every Mach-O in $APP ..."
+          # 1) Every Mach-O file (main executable, dylibs, framework binaries).
+          find "$APP" -type f | while IFS= read -r f; do
+            if file "$f" | grep -q "Mach-O"; then
+              codesign --remove-signature "$f" 2>/dev/null && echo "  stripped: $f" || true
+            fi
+          done
+          # 2) The framework bundles and the app bundle themselves.
+          find "$APP" -type d -name "*.framework" | while IFS= read -r fw; do
+            codesign --remove-signature "$fw" 2>/dev/null && echo "  stripped bundle: $fw" || true
+          done
+          codesign --remove-signature "$APP" 2>/dev/null || true
+          echo "Signature strip complete."
       - name: Package Runner.app into an unsigned .ipa
         script: |
           set -e
