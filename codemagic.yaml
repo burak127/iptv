@@ -1,18 +1,25 @@
-# Codemagic build recipe for producing an UNSIGNED iOS .ipa that can be
-# sideloaded onto an iPhone with AltStore / Sideloadly using a FREE Apple ID.
+# Codemagic build recipe for producing an iOS .ipa that can be sideloaded
+# onto an iPhone with AltStore using a FREE Apple ID.
 #
-# Why unsigned: sideload tools re-sign the app themselves with your free Apple
-# ID on your Windows PC, so Codemagic must NOT sign it (signing here would need
-# a paid Apple Developer account — exactly what this route avoids).
-#
-# How to use:
-#  1. Push this repo to GitHub/GitLab (or upload it in the Codemagic UI).
-#  2. On codemagic.io (free tier is enough), add the app and pick the
-#     "ios-sideload-unsigned" workflow below.
-#  3. Start a build. When it finishes, download the .ipa artifact.
-#  4. On your Windows PC, open Sideloadly (or AltStore), plug in the iPhone,
-#     sign in with your free Apple ID, drag in the .ipa, and install.
-#     (Free Apple ID signatures last 7 days; AltStore can auto-refresh them.)
+# ── Hard-won knowledge (2026-07-10) ─────────────────────────────────────────
+# AltServer signs apps with a vendored old `ldid` that hard-asserts
+#   ldid.cpp(1461): _assert(): end >= size - 0x10
+# unless every Mach-O's code-signature blob starts within 16 bytes of the
+# symbol string-table end. Two states BOTH fail that check on this app:
+#   1. The raw build output: media_kit/libmpv prebuilt dylibs ship with
+#      page-gapped signature offsets (same as Spotube/Kazumi/AnymeX/Fladder —
+#      all media_kit Flutter apps, all hit this exact assert).
+#   2. Signature-STRIPPED binaries (codesign --remove-signature): documented
+#      in Fladder #36/#800 — "completely unsigned inner Flutter frameworks"
+#      trigger the same assert. Stripping is the WRONG fix.
+# The CONFIRMED fix (AnymeX PR #93, merged with install proof; endorsed by
+# Kazumi's maintainer; Fladder screenshots) is to RE-SIGN everything with a
+# fresh dummy signature so each binary gets a compact, well-aligned
+# LC_CODE_SIGNATURE that old ldid can parse and then overwrite with the free
+# Apple ID. We use Apple's own `codesign -f -s -` (ad-hoc, zero secrets).
+# A verification gate below re-implements ldid's exact assert arithmetic and
+# FAILS THE BUILD if any binary would still trip it — no more blind downloads.
+# ─────────────────────────────────────────────────────────────────────────────
 
 workflows:
   ios-sideload-unsigned:
@@ -28,53 +35,107 @@ workflows:
         script: flutter pub get
       - name: Install CocoaPods dependencies
         script: cd ios && pod install
-      - name: Build unsigned iOS app
-        # --no-codesign: produce Runner.app without any signing identity.
+      - name: Build iOS app (no distribution signing)
         script: flutter build ios --release --no-codesign
-      - name: Strip code signatures for AltStore compatibility
-        # WHY: On Apple-Silicon build machines (this runner is an M2 Mac) the
-        # linker stamps every Mach-O with an "ad-hoc / linker-signed" signature
-        # even under --no-codesign. AltStore's bundled `ldid` cannot parse that
-        # newer signature format and aborts with:
-        #   ldid.cpp(1461): _assert(): end >= size - 0x10
-        # (Confirmed on AltStore issues #1660 / #1034 — Sideloadly/Esign work
-        #  because they use a different signer.) Removing the existing signature
-        # entirely gives ldid a clean binary to sign from scratch with the free
-        # Apple ID, sidestepping the parse assert. AltStore re-signs the app and
-        # ALL nested frameworks at install time, so shipping them unsigned here
-        # is correct.
+      - name: Ad-hoc re-sign every framework + app (AltStore ldid compatibility)
+        # Re-sign, do NOT strip: gives every Mach-O a fresh compact signature
+        # that AltServer's old ldid can parse (see header comment). Bottom-up:
+        # frameworks first, then the app shell. Stale _CodeSignature seals are
+        # removed first; codesign regenerates them consistently.
         script: |
           set -e
           APP="build/ios/iphoneos/Runner.app"
-          echo "Stripping signatures from every Mach-O in $APP ..."
-          # 1) Every Mach-O file (main executable, dylibs, framework binaries).
-          find "$APP" -type f | while IFS= read -r f; do
-            if file "$f" | grep -q "Mach-O"; then
-              codesign --remove-signature "$f" 2>/dev/null && echo "  stripped: $f" || true
-            fi
-          done
-          # 2) The framework bundles and the app bundle themselves.
-          find "$APP" -type d -name "*.framework" | while IFS= read -r fw; do
-            codesign --remove-signature "$fw" 2>/dev/null && echo "  stripped bundle: $fw" || true
-          done
-          codesign --remove-signature "$APP" 2>/dev/null || true
-          # 3) Belt-and-suspenders: delete every leftover _CodeSignature bundle seal.
-          #    codesign --remove-signature on a bundle whose inner binary is already
-          #    unsigned (step 1 stripped it first) errors out and leaves the stale
-          #    _CodeSignature/CodeResources dir behind — its hashes then reference the
-          #    now-modified binaries and cause an install-time mismatch. Remove them
-          #    outright so AltStore re-seals every bundle from scratch.
           find "$APP" -name "_CodeSignature" -type d -prune -exec rm -rf {} +
-          echo "Signature strip complete."
-      - name: Package Runner.app into an unsigned .ipa
+          for fw in "$APP"/Frameworks/*.framework; do
+            codesign --force --sign - --timestamp=none "$fw"
+            echo "re-signed: $fw"
+          done
+          codesign --force --sign - --timestamp=none "$APP"
+          echo "re-signed app shell: $APP"
+      - name: Gate — verify every binary passes AltServer's ldid assert
+        # Byte-for-byte replica of ldid Allocate() (the "end >= size - 0x10"
+        # assert): with a signature present, ldid requires
+        #   0 <= LC_CODE_SIGNATURE.dataoff - (stroff + strsize) <= 0x10
+        # If ANY binary fails, abort the build and name it — do not let a
+        # doomed ipa reach the user's phone.
+        script: |
+          set -e
+          cat > /tmp/ldid_gate.py << 'PYEOF'
+          import os, struct, sys
+
+          APP = "build/ios/iphoneos/Runner.app"
+          LC_SYMTAB, LC_CODE_SIGNATURE = 0x2, 0x1d
+          MAGICS = (0xcafebabe, 0xbebafeca, 0xfeedface, 0xcefaedfe, 0xfeedfacf, 0xcffaedfe)
+
+          def slices(data):
+              magic = struct.unpack(">I", data[:4])[0]
+              if magic in (0xcafebabe, 0xbebafeca):
+                  be = magic == 0xcafebabe
+                  n = struct.unpack((">" if be else "<") + "I", data[4:8])[0]
+                  off, out = 8, []
+                  for _ in range(n):
+                      o, s = struct.unpack((">" if be else "<") + "II", data[off+8:off+16])
+                      out.append((o, s)); off += 20
+                  return out
+              return [(0, len(data))]
+
+          bad, checked = [], 0
+          for root, dirs, files in os.walk(APP):
+              for fn in files:
+                  fp = os.path.join(root, fn)
+                  with open(fp, "rb") as fh:
+                      head = fh.read(4)
+                  if len(head) < 4 or struct.unpack(">I", head)[0] not in MAGICS:
+                      continue
+                  data = open(fp, "rb").read()
+                  for so, ssize in slices(data):
+                      m = struct.unpack(">I", data[so:so+4])[0]
+                      if m in (0xfeedface, 0xcefaedfe): is64, le = False, m == 0xcefaedfe
+                      elif m in (0xfeedfacf, 0xcffaedfe): is64, le = True, m == 0xcffaedfe
+                      else: continue
+                      e = "<" if le else ">"
+                      ncmds = struct.unpack(e+"I", data[so+16:so+20])[0]
+                      off = so + (32 if is64 else 28)
+                      stroff = strsize = sig = None
+                      for _ in range(ncmds):
+                          cmd, csz = struct.unpack(e+"II", data[off:off+8])
+                          if cmd == LC_SYMTAB:
+                              _, _, stroff, strsize = struct.unpack(e+"IIII", data[off+8:off+24])
+                          elif cmd == LC_CODE_SIGNATURE:
+                              sig = struct.unpack(e+"I", data[off+8:off+12])[0]
+                          off += csz
+                      rel = os.path.relpath(fp, APP)
+                      checked += 1
+                      if sig is None:
+                          bad.append(f"{rel}: NO code signature (re-sign step failed?)")
+                          continue
+                      if stroff is None or (stroff == 0 and strsize == 0):
+                          print(f"  ok (no symtab)      {rel}")
+                          continue
+                      end, size = stroff + strsize, sig
+                      gap = size - end
+                      if end <= size and end >= size - 0x10:
+                          print(f"  ok (gap {gap:>3})       {rel}")
+                      else:
+                          bad.append(f"{rel}: gap {gap} bytes — ldid WILL abort on this file")
+
+          print(f"\nchecked {checked} Mach-O slices")
+          if bad:
+              print("GATE FAILED — these binaries would trip AltServer's ldid assert:")
+              for b in bad: print("   " + b)
+              sys.exit(1)
+          print("GATE PASSED — every binary satisfies ldid's end >= size - 0x10 check.")
+          PYEOF
+          python3 /tmp/ldid_gate.py
+      - name: Package Runner.app into the .ipa
         script: |
           set -e
           cd build/ios/iphoneos
+          rm -rf Payload
           mkdir -p Payload
           cp -R Runner.app Payload/
           zip -r9 iptv_player-unsigned.ipa Payload
           rm -rf Payload
     artifacts:
-      # Download this from the Codemagic build page, then feed it to
-      # Sideloadly / AltStore on your PC.
+      # Download this from the Codemagic build page, then install via AltStore.
       - build/ios/iphoneos/*.ipa
