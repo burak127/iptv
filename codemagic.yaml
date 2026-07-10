@@ -58,6 +58,13 @@ workflows:
             codesign --remove-signature "$fw" 2>/dev/null && echo "  stripped bundle: $fw" || true
           done
           codesign --remove-signature "$APP" 2>/dev/null || true
+          # 3) Belt-and-suspenders: delete every leftover _CodeSignature bundle seal.
+          #    codesign --remove-signature on a bundle whose inner binary is already
+          #    unsigned (step 1 stripped it first) errors out and leaves the stale
+          #    _CodeSignature/CodeResources dir behind — its hashes then reference the
+          #    now-modified binaries and cause an install-time mismatch. Remove them
+          #    outright so AltStore re-seals every bundle from scratch.
+          find "$APP" -name "_CodeSignature" -type d -prune -exec rm -rf {} +
           echo "Signature strip complete."
       - name: Package Runner.app into an unsigned .ipa
         script: |
