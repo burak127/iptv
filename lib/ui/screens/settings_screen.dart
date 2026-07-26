@@ -96,9 +96,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 secondary: const Icon(Icons.tv),
                 title: const Text('Native afspiller (glat på TV-bokse)'),
                 subtitle: const Text(
-                  'Bruger ExoPlayer + hardware-overlay til live-TV — samme metode '
-                  'som TiviMate. Fjerner hakket på svage bokse. Kun live-TV; '
-                  'genåbn kanalen efter ændring.',
+                  'Bruger ExoPlayer + hardware-overlay — samme metode som '
+                  'TiviMate. Fjerner hakket på svage bokse. Gælder både '
+                  'live-TV og film/serier; genåbn efter ændring.',
                 ),
                 value: nativePlayer,
                 onChanged: (v) async {

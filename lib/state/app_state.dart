@@ -671,10 +671,19 @@ class AppState extends ChangeNotifier {
     return _progress.subtitleChoice(s.id, itemKey);
   }
 
-  Future<void> saveSubtitleChoice(String itemKey, String url, String lang) async {
+  Future<void> saveSubtitleChoice(String itemKey, SubtitleChoice choice) async {
     final s = active;
     if (s == null) return;
-    await _progress.setSubtitleChoice(s.id, itemKey, url, lang);
+    await _progress.setSubtitleChoice(s.id, itemKey, choice);
+  }
+
+  /// Persist the timing calibration (offset + drift factor) onto the item's
+  /// existing subtitle choice, if any.
+  Future<void> saveSubtitleTiming(
+      String itemKey, double offsetSecs, double speed) async {
+    final s = active;
+    if (s == null) return;
+    await _progress.setSubtitleTiming(s.id, itemKey, offsetSecs, speed);
   }
 
   Future<void> clearSubtitleChoice(String itemKey) async {

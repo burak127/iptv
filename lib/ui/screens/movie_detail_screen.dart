@@ -93,6 +93,8 @@ class _MovieDetailScreenState extends State<MovieDetailScreen> {
           searchTitle: _movie.name,
           movies: (siblings != null && siblings.length > 1) ? siblings : null,
           movieIndex: siblingIndex >= 0 ? siblingIndex : null,
+          favoriteKind: MediaKind.vod,
+          favoriteId: _movie.id,
         ),
       ),
     );

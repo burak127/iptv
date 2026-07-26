@@ -24,6 +24,33 @@ class NativeVideoPosition {
   final Duration duration;
 }
 
+/// One embedded track inside the stream container, as reported by ExoPlayer's
+/// onTracksChanged — [group]/[track] are the indexes the selection commands
+/// take, `"$group:$track"` is the stable persistence key (see SubtitleChoice).
+class NativeTrackInfo {
+  const NativeTrackInfo({
+    required this.group,
+    required this.track,
+    this.language,
+    this.label,
+    this.selected = false,
+  });
+  final int group;
+  final int track;
+  final String? language;
+  final String? label;
+  final bool selected;
+
+  String get id => '$group:$track';
+}
+
+/// The embedded text + audio track lists pushed on every onTracksChanged.
+class NativeTracks {
+  const NativeTracks({this.text = const [], this.audio = const []});
+  final List<NativeTrackInfo> text;
+  final List<NativeTrackInfo> audio;
+}
+
 /// Controls a single native ExoPlayer instance over its per-view MethodChannel.
 class NativeVideoController {
   NativeVideoController._(int id)
@@ -38,11 +65,24 @@ class NativeVideoController {
   final StreamController<NativeVideoPosition> _position =
       StreamController<NativeVideoPosition>.broadcast();
   final StreamController<double> _aspectRatio = StreamController<double>.broadcast();
+  final StreamController<NativeTracks> _tracks =
+      StreamController<NativeTracks>.broadcast();
+  final StreamController<String> _cues = StreamController<String>.broadcast();
 
   /// "buffering" | "ready" | "ended" | "idle".
   Stream<String> get stateStream => _state.stream;
   Stream<NativeVideoError> get errorStream => _error.stream;
   Stream<NativeVideoPosition> get positionStream => _position.stream;
+
+  /// Embedded track lists (text + audio), re-pushed on every change.
+  Stream<NativeTracks> get tracksStream => _tracks.stream;
+
+  /// Currently-displayed embedded cue text, pushed by ExoPlayer AT display
+  /// time (perfect sync, no Dart-side timing). Empty string = nothing shown.
+  Stream<String> get cuesStream => _cues.stream;
+
+  /// Last pushed track lists — so UI opened after the push still sees them.
+  NativeTracks tracks = const NativeTracks();
   /// Display aspect ratio (width/height, already folding in non-square
   /// pixels) — a SurfaceView always stretches to fill its own bounds with no
   /// "fit" concept of its own, so the caller uses this to do the actual
@@ -87,6 +127,31 @@ class NativeVideoController {
           if (ratio != null && ratio > 0) _aspectRatio.add(ratio);
         }
         break;
+      case 'tracks':
+        if (_tracks.isClosed) break;
+        final args = call.arguments;
+        if (args is Map) {
+          List<NativeTrackInfo> parse(dynamic raw) => [
+                for (final t in (raw is List ? raw : const []))
+                  if (t is Map)
+                    NativeTrackInfo(
+                      group: (t['group'] as num?)?.toInt() ?? 0,
+                      track: (t['track'] as num?)?.toInt() ?? 0,
+                      language: t['language'] as String?,
+                      label: t['label'] as String?,
+                      selected: t['selected'] as bool? ?? false,
+                    ),
+              ];
+          tracks = NativeTracks(
+            text: parse(args['text']),
+            audio: parse(args['audio']),
+          );
+          _tracks.add(tracks);
+        }
+        break;
+      case 'cues':
+        if (!_cues.isClosed) _cues.add(call.arguments as String? ?? '');
+        break;
     }
   }
 
@@ -102,6 +167,12 @@ class NativeVideoController {
   Future<void> play() => _channel.invokeMethod('play').catchError((_) {});
   Future<void> pause() => _channel.invokeMethod('pause').catchError((_) {});
   Future<void> stop() => _channel.invokeMethod('stop').catchError((_) {});
+  Future<void> setTextTrack(NativeTrackInfo t) => _channel.invokeMethod(
+      'setTextTrack', {'group': t.group, 'track': t.track}).catchError((_) {});
+  Future<void> disableTextTrack() =>
+      _channel.invokeMethod('disableTextTrack').catchError((_) {});
+  Future<void> setAudioTrack(NativeTrackInfo t) => _channel.invokeMethod(
+      'setAudioTrack', {'group': t.group, 'track': t.track}).catchError((_) {});
 
   void dispose() {
     _channel.setMethodCallHandler(null);
@@ -109,6 +180,8 @@ class NativeVideoController {
     _error.close();
     _position.close();
     _aspectRatio.close();
+    _tracks.close();
+    _cues.close();
   }
 }
 
@@ -128,10 +201,13 @@ class NativeVideo extends StatefulWidget {
 
   final String url;
   final String userAgent;
-  /// Resume offset for on-demand content — ignored for live (always null
-  /// there). Only applied on the INITIAL open; a later [didUpdateWidget] URL
-  /// change (e.g. next-episode) intentionally starts that new item at 0
-  /// unless the caller rebuilds this widget with a fresh key.
+  /// Resume offset for whatever [url] currently points at — ignored for live
+  /// (always null there). Applied on the initial open AND on every later
+  /// [url] change, so switching to an adjacent movie picks up that movie's
+  /// own saved position. The caller is responsible for clearing it when the
+  /// new item should genuinely start at 0 (next-episode does exactly that —
+  /// see PlaybackController.openOnDemand, which resets `pendingStartAt` per
+  /// item from the `startAt` it was handed).
   final Duration? startAt;
   final NativeVideoCreated? onCreated;
 
@@ -147,8 +223,13 @@ class _NativeVideoState extends State<NativeVideo> {
     super.didUpdateWidget(old);
     // Zapping to another channel, or advancing to the next episode: just hand
     // the new URL to the running player (no teardown of the platform view).
+    // The resume offset MUST ride along — dropping it here meant "switch movie
+    // like a channel" always restarted the next film from 0:00 on the native
+    // TV path, silently discarding the saved position _playAdjacentMovie had
+    // just looked up and handed to openOnDemand.
     if (old.url != widget.url) {
-      _controller?.setSource(widget.url, userAgent: widget.userAgent);
+      _controller?.setSource(widget.url,
+          userAgent: widget.userAgent, startAt: widget.startAt);
     }
   }
 

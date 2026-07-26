@@ -40,13 +40,61 @@ class ResumePoint {
       durationSecs <= 0 ? 0 : (positionSecs / durationSecs).clamp(0.0, 1.0);
 }
 
-/// An external subtitle the user picked for a specific movie/episode —
-/// remembered so reopening that same item later (e.g. via "Fortsæt") can
-/// silently reload it instead of starting the search from scratch every time.
+/// The subtitle the user picked for a specific movie/episode — remembered so
+/// reopening that same item later (e.g. via "Fortsæt") can silently restore it
+/// instead of starting over every time. Two kinds:
+///  - 'external': a downloaded SRT/VTT ([url] points at it, [trackId] null)
+///  - 'embedded': a track inside the stream container ([url] empty; [trackId]
+///    is the mpv track id on the media_kit path, or "group:track" on the
+///    native ExoPlayer path)
+/// [offsetSecs]/[speed] persist the user's timing calibration (constant shift
+/// + linear drift factor) so a painstakingly synced subtitle stays synced on
+/// the next open — previously the FILE choice was restored but the timing was
+/// silently discarded.
 class SubtitleChoice {
   final String url;
   final String lang; // display label, e.g. "Dansk"
-  const SubtitleChoice(this.url, this.lang);
+  final String kind; // 'external' | 'embedded'
+  final String? trackId;
+  final double offsetSecs;
+  final double speed;
+  const SubtitleChoice(
+    this.url,
+    this.lang, {
+    this.kind = 'external',
+    this.trackId,
+    this.offsetSecs = 0,
+    this.speed = 1.0,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'url': url,
+        'lang': lang,
+        'kind': kind,
+        if (trackId != null) 'tid': trackId,
+        if (offsetSecs != 0) 'off': offsetSecs,
+        if (speed != 1.0) 'spd': speed,
+      };
+
+  /// Legacy entries ({url, lang} only) decode as kind 'external' with neutral
+  /// timing — older saves keep working unchanged.
+  static SubtitleChoice fromJson(Map<String, dynamic> v) => SubtitleChoice(
+        v['url'] as String? ?? '',
+        v['lang'] as String? ?? '',
+        kind: v['kind'] as String? ?? 'external',
+        trackId: v['tid'] as String?,
+        offsetSecs: (v['off'] as num?)?.toDouble() ?? 0,
+        speed: (v['spd'] as num?)?.toDouble() ?? 1.0,
+      );
+
+  SubtitleChoice withTiming(double offsetSecs, double speed) => SubtitleChoice(
+        url,
+        lang,
+        kind: kind,
+        trackId: trackId,
+        offsetSecs: offsetSecs,
+        speed: speed,
+      );
 }
 
 /// Favorites, recently-watched, resume positions and the parental PIN. Small
@@ -179,11 +227,18 @@ class ProgressRepository {
     if (raw == null) return {};
     try {
       final m = jsonDecode(raw) as Map<String, dynamic>;
-      return m.map((k, v) => MapEntry(
-          k, SubtitleChoice(v['url'] as String, v['lang'] as String)));
+      return m.map((k, v) =>
+          MapEntry(k, SubtitleChoice.fromJson(v as Map<String, dynamic>)));
     } catch (_) {
       return {};
     }
+  }
+
+  Future<void> _writeSubtitleMap(
+      String sourceId, Map<String, SubtitleChoice> m) async {
+    final p = await _prefs;
+    await p.setString(_subtitleKey(sourceId),
+        jsonEncode(m.map((k, v) => MapEntry(k, v.toJson()))));
   }
 
   Future<SubtitleChoice?> subtitleChoice(String sourceId, String itemKey) async {
@@ -192,20 +247,28 @@ class ProgressRepository {
   }
 
   Future<void> setSubtitleChoice(
-      String sourceId, String itemKey, String url, String lang) async {
-    final p = await _prefs;
+      String sourceId, String itemKey, SubtitleChoice choice) async {
     final m = await _subtitleMap(sourceId);
-    m[itemKey] = SubtitleChoice(url, lang);
-    await p.setString(_subtitleKey(sourceId),
-        jsonEncode(m.map((k, v) => MapEntry(k, {'url': v.url, 'lang': v.lang}))));
+    m[itemKey] = choice;
+    await _writeSubtitleMap(sourceId, m);
+  }
+
+  /// Update just the timing calibration of an existing choice — no-op when the
+  /// item has no saved choice (a session-only tweak of a default track).
+  Future<void> setSubtitleTiming(
+      String sourceId, String itemKey, double offsetSecs, double speed) async {
+    final m = await _subtitleMap(sourceId);
+    final existing = m[itemKey];
+    if (existing == null) return;
+    if (existing.offsetSecs == offsetSecs && existing.speed == speed) return;
+    m[itemKey] = existing.withTiming(offsetSecs, speed);
+    await _writeSubtitleMap(sourceId, m);
   }
 
   Future<void> clearSubtitleChoice(String sourceId, String itemKey) async {
-    final p = await _prefs;
     final m = await _subtitleMap(sourceId);
     if (m.remove(itemKey) == null) return;
-    await p.setString(_subtitleKey(sourceId),
-        jsonEncode(m.map((k, v) => MapEntry(k, {'url': v.url, 'lang': v.lang}))));
+    await _writeSubtitleMap(sourceId, m);
   }
 
   /// Delete every persisted key belonging to a removed source.

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../../models/download_item.dart';
+import '../../models/media_item.dart' show MediaKind;
 import '../../models/series.dart';
 import '../../services/download_manager.dart';
 import '../../services/http_client.dart';
@@ -105,6 +106,8 @@ class _SeriesDetailScreenState extends State<SeriesDetailScreen> {
         episode: ep.episodeNumber,
         episodes: allEpisodes,
         episodeIndex: epIndex >= 0 ? epIndex : null,
+        favoriteKind: MediaKind.series,
+        favoriteId: widget.series.id,
       ),
     ));
   }
@@ -114,6 +117,22 @@ class _SeriesDetailScreenState extends State<SeriesDetailScreen> {
     return Scaffold(
       appBar: AppBar(
         title: Text(widget.series.name, maxLines: 1, overflow: TextOverflow.ellipsis),
+        actions: [
+          Consumer<AppState>(
+            builder: (context, state, _) {
+              final fav = state.isFavorite(MediaKind.series, widget.series.id);
+              return IconButton(
+                tooltip: fav ? 'Fjern favorit' : 'Tilføj favorit',
+                onPressed: () =>
+                    state.toggleFavorite(MediaKind.series, widget.series.id),
+                icon: Icon(
+                  fav ? Icons.star : Icons.star_border,
+                  color: fav ? Colors.amber : null,
+                ),
+              );
+            },
+          ),
+        ],
       ),
       body: _body(),
     );

@@ -323,6 +323,11 @@ class PlaybackController extends ChangeNotifier {
       _lastUrl = url;
       _externalPlaying = true; // fresh item always starts playing
       externalSubtitleTitle = null; // belongs to the previous item, not this one
+      // Timing calibration belongs to the previous item too — the mpv branch
+      // resets it in _play(), which this branch never reaches, so a delay
+      // nudged for episode N used to silently leak into episode N+1 here.
+      subDelaySecs = 0;
+      subSpeed = 1.0;
       hasError = false;
       errorMessage = null;
       _suppressResume = true;
@@ -355,10 +360,14 @@ class PlaybackController extends ChangeNotifier {
     hasError = false;
     errorMessage = null;
     videoAspect = null; // stale shape from the previous item must not leak
-    // New content: timing offset and external subtitle belong to the old one.
+    // New content: timing calibration and external subtitle belong to the old one.
     if (subDelaySecs != 0) {
       subDelaySecs = 0;
       unawaited(_setMpvProperty('sub-delay', '0'));
+    }
+    if (subSpeed != 1.0) {
+      subSpeed = 1.0;
+      unawaited(_setMpvProperty('sub-speed', '1'));
     }
     externalSubtitleTitle = null;
     notifyListeners();
@@ -467,23 +476,32 @@ class PlaybackController extends ChangeNotifier {
     }
   }
 
-  void seek(Duration to) {
-    if (_routeToExternal) {
-      externalSeekHandler?.call(to);
-    } else {
-      _player.seek(to);
+  /// Keep a seek target inside the playable range. The upper bound stops one
+  /// second SHORT of the end on purpose: landing exactly on (or past) the end
+  /// makes both mpv and ExoPlayer report completion, which on a series fires
+  /// the auto-next-episode countdown and on a movie writes a "finished"
+  /// resume point — a spammed skip-forward near the end must not silently do
+  /// either. Exposed so the UI can preview a pending skip at the same
+  /// position the seek will actually land on.
+  Duration clampSeek(Duration to) {
+    var t = to;
+    if (duration > const Duration(seconds: 1)) {
+      final maxT = duration - const Duration(seconds: 1);
+      if (t > maxT) t = maxT;
     }
+    return t < Duration.zero ? Duration.zero : t;
   }
 
-  void seekBy(Duration delta) {
-    final t = position + delta;
-    final clamped = t < Duration.zero ? Duration.zero : t;
+  void seek(Duration to) {
+    final clamped = clampSeek(to);
     if (_routeToExternal) {
       externalSeekHandler?.call(clamped);
     } else {
       _player.seek(clamped);
     }
   }
+
+  void seekBy(Duration delta) => seek(position + delta);
 
   // ---------------- error / reconnect ----------------
   void _onError(String err) {
@@ -576,6 +594,7 @@ class PlaybackController extends ChangeNotifier {
   // ---------------- subtitles (external / style / timing) ----------------
   double subFontSize = 55; // mpv default
   double subDelaySecs = 0;
+  double subSpeed = 1.0; // linear drift factor — see nudgeSubtitleSpeed
   String? externalSubtitleTitle; // name of the loaded external subtitle
 
   Future<void> _setMpvProperty(String name, String value) async {
@@ -619,9 +638,32 @@ class PlaybackController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Linear drift correction: multiply subtitle event timestamps by
+  /// [subSpeed]. Fixes files authored for a different framerate/cut, which a
+  /// constant offset mathematically can't ("5s early at one point, 10s late
+  /// later in the same movie"). mpv applies it via `sub-speed`; the native
+  /// ExoPlayer path applies the identical math in the Dart overlay lookup
+  /// (display when (position - delay) / speed falls inside a cue).
+  Future<void> nudgeSubtitleSpeed(double delta) async {
+    subSpeed = double.parse((subSpeed + delta).clamp(0.9, 1.1).toStringAsFixed(4));
+    await _setMpvProperty('sub-speed', '$subSpeed');
+    notifyListeners();
+  }
+
+  /// Apply a persisted timing calibration in one go (see SubtitleChoice).
+  Future<void> applySubtitleTiming(double offsetSecs, double speed) async {
+    subDelaySecs = offsetSecs;
+    subSpeed = speed.clamp(0.9, 1.1);
+    await _setMpvProperty('sub-delay', '$subDelaySecs');
+    await _setMpvProperty('sub-speed', '$subSpeed');
+    notifyListeners();
+  }
+
   Future<void> resetSubtitleDelay() async {
     subDelaySecs = 0;
+    subSpeed = 1.0;
     await _setMpvProperty('sub-delay', '0');
+    await _setMpvProperty('sub-speed', '1');
     notifyListeners();
   }
 

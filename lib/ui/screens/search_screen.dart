@@ -189,17 +189,41 @@ class _SearchScreenState extends State<SearchScreen> {
       case MediaKind.live:
         final channel = item as LiveChannel;
         state.markWatched(channel);
+        // Open the channel INSIDE its own category list — not as a list of
+        // one — so up/down zapping works exactly like tapping it in that
+        // category. Fall back to the full channel list, then to the single
+        // channel, if the category can't be resolved (e.g. provider refresh
+        // moved it since the search index was built).
+        var playlist = state.channelsInCategory(channel.categoryId);
+        var index = playlist.indexWhere((c) => c.id == channel.id);
+        if (index < 0) {
+          playlist = state.channels;
+          index = playlist.indexWhere((c) => c.id == channel.id);
+        }
+        if (index < 0) {
+          playlist = [channel];
+          index = 0;
+        }
         Navigator.of(context).push(MaterialPageRoute(
           builder: (_) => PlayerScreen.live(
             source: state.active!,
-            playlist: [channel],
-            initialIndex: 0,
+            playlist: playlist,
+            initialIndex: index,
           ),
         ));
         break;
       case MediaKind.vod:
+        final movie = item as Movie;
+        // Pass the movie's own category peers so "switch movie like a channel"
+        // (prev/next + swipe) works from a search result too — same as opening
+        // it from the Film grid.
+        final siblings =
+            state.movies.where((m) => m.categoryId == movie.categoryId).toList();
         Navigator.of(context).push(MaterialPageRoute(
-          builder: (_) => MovieDetailScreen(movie: item as Movie),
+          builder: (_) => MovieDetailScreen(
+            movie: movie,
+            siblingMovies: siblings.length > 1 ? siblings : null,
+          ),
         ));
         break;
       case MediaKind.series:

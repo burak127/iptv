@@ -122,7 +122,15 @@ class SubtitleSearch {
       }
       bytes = unzipped;
     }
-    final text = utf8.decode(bytes, allowMalformed: true);
+    // Try strict UTF-8 first; on failure fall back to Latin-1 instead of
+    // letting allowMalformed turn every æ/ø/å into U+FFFD garbage — older
+    // Danish subtitles on OpenSubtitles are very often ISO-8859-1/Win-1252.
+    String text;
+    try {
+      text = utf8.decode(bytes);
+    } on FormatException {
+      text = latin1.decode(bytes);
+    }
     if (!text.contains('-->')) {
       // Neither SRT nor VTT timing markers — probably an error page.
       throw Exception('Filen ligner ikke en undertekst.');

@@ -9,11 +9,13 @@ import 'package:provider/provider.dart';
 import '../../models/epg.dart';
 import '../../models/iptv_source.dart';
 import '../../models/live_channel.dart';
+import '../../models/media_item.dart' show MediaKind;
 import '../../models/movie.dart';
 import '../../models/series.dart';
 import '../../services/download_manager.dart';
 import '../../services/http_client.dart';
 import '../../services/pip_service.dart';
+import '../../services/progress_repository.dart' show SubtitleChoice;
 import '../../services/stream_url_builder.dart';
 import '../../services/subtitle_parser.dart';
 import '../../services/subtitle_search.dart';
@@ -26,6 +28,22 @@ import '../widgets/native_video.dart';
 
 /// Fixed surf-drawer row height so scroll-to-current is exact.
 const double _kSurfRowHeight = 48;
+
+/// How far the [nth] skip of one burst jumps (see [_PlayerScreenState._skip]).
+///
+/// A burst is a run of double-taps on the same side of the screen — or a held
+/// D-pad arrow — with less than ~0.9s between them. The first steps are the
+/// familiar 10s so an ordinary double-tap behaves exactly like Netflix's;
+/// sustained spamming grows the step, so reaching several minutes ahead takes
+/// a handful of taps instead of thirty. Cumulative totals: 10, 20, 30, 40, 60,
+/// 80, 100, 130, 160, 190…
+///
+/// Top-level (not a private method) purely so it can be unit-tested.
+Duration skipStepFor(int nth) {
+  if (nth <= 4) return const Duration(seconds: 10);
+  if (nth <= 7) return const Duration(seconds: 20);
+  return const Duration(seconds: 30);
+}
 
 class PlayerScreen extends StatefulWidget {
   const PlayerScreen.live({
@@ -45,7 +63,9 @@ class PlayerScreen extends StatefulWidget {
         episodes = null,
         episodeIndex = null,
         movies = null,
-        movieIndex = null;
+        movieIndex = null,
+        favoriteKind = null,
+        favoriteId = null;
 
   const PlayerScreen.onDemand({
     super.key,
@@ -62,6 +82,8 @@ class PlayerScreen extends StatefulWidget {
     this.episodeIndex,
     this.movies,
     this.movieIndex,
+    this.favoriteKind,
+    this.favoriteId,
   })  : mode = PlaybackMode.onDemand,
         playlist = const [],
         initialIndex = 0;
@@ -92,6 +114,14 @@ class PlayerScreen extends StatefulWidget {
   final List<Movie>? movies;
   final int? movieIndex;
 
+  /// What the in-player favorite star toggles for on-demand content — the
+  /// movie ([MediaKind.vod]) or the series ([MediaKind.series]) being watched.
+  /// Null when the opener doesn't know a stable id (e.g. a local download),
+  /// in which case the star simply doesn't show. Live uses the current
+  /// channel instead (see [_favId]).
+  final MediaKind? favoriteKind;
+  final String? favoriteId;
+
   @override
   State<PlayerScreen> createState() => _PlayerScreenState();
 }
@@ -119,13 +149,59 @@ class _PlayerScreenState extends State<PlayerScreen>
   final FocusNode _aspectFocus = FocusNode(debugLabel: 'player-aspect');
   final FocusNode _tracksFocus = FocusNode(debugLabel: 'player-tracks');
   final FocusNode _sleepFocus = FocusNode(debugLabel: 'player-sleep');
+  final FocusNode _favFocus = FocusNode(debugLabel: 'player-fav');
   Set<FocusNode> get _topRowFocusNodes => {
         _backFocus,
+        if (_canFavorite) _favFocus,
         if (_pipSupported) _pipFocus,
         _aspectFocus,
         _tracksFocus,
         _sleepFocus,
       };
+
+  /// Kind/id the in-player favorite star acts on. Live = the current channel;
+  /// on-demand = the movie/series passed in (and, while browsing sibling
+  /// movies, the movie currently on screen — so favoriting after a swipe hits
+  /// the right film).
+  MediaKind? get _favKind => _isLive ? MediaKind.live : widget.favoriteKind;
+  String? get _favId {
+    if (_isLive) return _pc.currentChannel?.id;
+    final list = widget.movies;
+    final i = _movieIdx;
+    if (list != null && i != null && i >= 0 && i < list.length) {
+      return list[i].id;
+    }
+    return widget.favoriteId;
+  }
+
+  bool get _canFavorite => _favKind != null && _favId != null;
+
+  /// Star button in the player top bar — favorite the thing you're watching
+  /// (channel / movie / series) without leaving playback. Reflects + toggles
+  /// the same favorites the grids use. Hidden when there's no stable id.
+  Widget _favoriteButton() {
+    final kind = _favKind;
+    final id = _favId;
+    if (kind == null || id == null) return const SizedBox.shrink();
+    return Consumer<AppState>(
+      builder: (context, appState, _) {
+        final fav = appState.isFavorite(kind, id);
+        return FocusRing(
+          shape: BoxShape.circle,
+          child: IconButton(
+            focusNode: _favFocus,
+            tooltip: fav ? 'Fjern favorit' : 'Tilføj favorit',
+            onPressed: () {
+              appState.toggleFavorite(kind, id);
+              _snack(fav ? 'Fjernet fra favoritter' : 'Tilføjet til favoritter');
+            },
+            icon: Icon(fav ? Icons.star : Icons.star_border,
+                color: fav ? Colors.amber : Colors.white),
+          ),
+        );
+      },
+    );
+  }
   // Live's bottom row (prev/next/channel-list) has the exact same "far apart,
   // differently-shaped rows" geometry as on-demand's slider+circle-buttons —
   // give it the same explicit-jump treatment instead of default traversal.
@@ -172,24 +248,177 @@ class _PlayerScreenState extends State<PlayerScreen>
   Timer? _nextTimer;
   bool _pipSupported = false;
 
-  // On-demand scrub: buffer key-repeat seek deltas (D-pad hold) and slider drag
-  // updates, and only issue ONE real mpv seek after things settle. Each mpv
-  // seek is a synchronous, FIFO-serialized native call — dispatching one per
-  // drag-pixel/key-repeat tick queued dozens of seeks back-to-back and froze
-  // playback for a second or more after any scrub or held seek key.
+  // On-demand scrub: buffer key-repeat seek deltas (D-pad hold), double-tap
+  // skips and slider drag updates, and only issue ONE real seek after things
+  // settle. Each mpv seek is a synchronous, FIFO-serialized native call —
+  // dispatching one per drag-pixel/tap/key-repeat tick queued dozens of seeks
+  // back-to-back and froze playback for a second or more afterwards.
   Duration? _dragPosition;
-  Duration _pendingSeekDelta = Duration.zero;
-  Timer? _seekDebounce;
 
-  void _seekByDebounced(Duration delta) {
-    _pendingSeekDelta += delta;
-    _revealControls();
-    _seekDebounce?.cancel();
-    _seekDebounce = Timer(const Duration(milliseconds: 300), () {
-      final d = _pendingSeekDelta;
-      _pendingSeekDelta = Duration.zero;
-      if (d != Duration.zero) _pc.seekBy(d);
+  // ---------------- skip (double-tap / D-pad, escalating) ----------------
+  // Netflix-style: double-tap the right or left side of the screen to jump
+  // 10s, and keep tapping to jump further — every extra tap in the same burst
+  // adds to the SAME pending jump, so spamming lands one big seek instead of
+  // a dozen small ones. The same burst logic backs the D-pad arrows on TV, so
+  // holding ▶ fast-forwards instead of crawling 10s per repeat.
+
+  /// Where the pending jump is heading — also what the seek bar previews
+  /// while the burst is still open (the player is still sitting at the old
+  /// position until the debounce fires).
+  Duration? _skipTarget;
+  /// -1 = backwards, +1 = forwards, 0 = no burst in progress.
+  int _skipDirection = 0;
+  /// Skips accumulated in the current burst (drives the escalating step).
+  int _skipCount = 0;
+  /// Total of the current burst — the number shown in the on-screen badge.
+  Duration _skipAccum = Duration.zero;
+  Timer? _skipCommitTimer; // fires the one real seek once the burst settles
+  Timer? _skipBadgeTimer; // clears the badge (and ends the burst) after it
+  Timer? _skipPreviewTimer; // safety net: drop the preview if the seek never lands
+
+  /// True while seeking makes any sense at all — live has no timeline, and an
+  /// error/auto-next overlay owns the screen instead.
+  bool get _canSkip =>
+      !_isLive && !_pc.hasError && _nextCountdown == null;
+
+  /// Add one skip to the current burst. [direction] is +1 (forward) or -1
+  /// (back). [step] overrides the escalating ladder (dedicated ⏩/⏪ media
+  /// keys use their own bigger fixed step).
+  void _skip(int direction, {Duration? step}) {
+    if (!_canSkip) return;
+    // Reversing mid-burst restarts the count, so the badge reads "10 sek"
+    // again rather than continuing the old direction's total.
+    if (direction != _skipDirection) {
+      _skipDirection = direction;
+      _skipCount = 0;
+      _skipAccum = Duration.zero;
+    }
+    _skipCount++;
+    final delta = step ?? skipStepFor(_skipCount);
+    _skipAccum += delta;
+    // Chain off the pending target, not the (still stale) player position —
+    // otherwise every tap of a burst would recompute the same +10s.
+    final base = _skipTarget ?? _pc.position;
+    _skipTarget = _pc.clampSeek(base + delta * direction);
+    _revealControls(); // also setState()s, so the badge + seek bar redraw
+
+    _skipCommitTimer?.cancel();
+    _skipCommitTimer = Timer(const Duration(milliseconds: 320), () {
+      _skipCommitTimer = null;
+      final t = _skipTarget;
+      if (t != null) _pc.seek(t);
+      // Keep previewing the target until the player actually reports landing
+      // there (see _onControllerTick) — clearing it the instant the seek is
+      // issued made the bar snap back to the old spot for a frame or two.
+      _skipPreviewTimer?.cancel();
+      _skipPreviewTimer = Timer(const Duration(seconds: 5), () {
+        if (mounted) setState(() => _skipTarget = null);
+      });
     });
+    _skipBadgeTimer?.cancel();
+    _skipBadgeTimer = Timer(const Duration(milliseconds: 900), () {
+      if (!mounted) return;
+      setState(() {
+        _skipDirection = 0;
+        _skipCount = 0;
+        _skipAccum = Duration.zero;
+      });
+    });
+  }
+
+  /// Position the seek bar/clock should show: a live slider drag wins, then a
+  /// pending skip target, then the player's own position.
+  Duration get _displayPosition => _dragPosition ?? _skipTarget ?? _pc.position;
+
+  // Fraction of the width at each edge that acts as a double-tap skip zone.
+  // The middle band stays a plain "show/hide the controls" tap.
+  static const double _kSkipZoneFraction = 0.35;
+
+  /// Side zone whose double-tap window is currently open (see [_onTapUpAt]).
+  int _armedTapZone = 0;
+  Timer? _tapArmTimer;
+
+  /// Single entry point for every tap on the video surface.
+  ///
+  /// The middle band is a plain show/hide-the-controls tap. In a side zone
+  /// the FIRST tap also toggles the controls immediately — deferring it until
+  /// the double-tap window expired would put a dead ~250ms in front of the
+  /// most common gesture in the app — and arms the window instead. A second
+  /// tap inside the window is the skip; from there the burst is open and
+  /// every further tap skips again (the spam case), no double-tap needed.
+  ///
+  /// The eager toggle costs nothing visually in the case that matters: while
+  /// watching, the controls are hidden, so tap 1 reveals them and tap 2's
+  /// [_skip] keeps them up via its own [_revealControls].
+  void _onTapUpAt(Offset local, double width) {
+    var zone = 0;
+    if (_canSkip && width > 0) {
+      if (local.dx < width * _kSkipZoneFraction) {
+        zone = -1;
+      } else if (local.dx > width * (1 - _kSkipZoneFraction)) {
+        zone = 1;
+      }
+    }
+    if (zone == 0) {
+      _cancelArmedTap();
+      _toggleControls();
+      return;
+    }
+    // Burst already running in this zone (or its badge still up) — keep going.
+    if (_skipDirection == zone && _skipCount > 0) {
+      _cancelArmedTap();
+      _skip(zone);
+      return;
+    }
+    // Second tap of a fresh double-tap in the same zone: the first real skip.
+    if (_armedTapZone == zone) {
+      _cancelArmedTap();
+      _skip(zone);
+      return;
+    }
+    _cancelArmedTap();
+    _armedTapZone = zone;
+    _tapArmTimer = Timer(const Duration(milliseconds: 300), () {
+      _tapArmTimer = null;
+      _armedTapZone = 0;
+    });
+    _toggleControls();
+  }
+
+  void _cancelArmedTap() {
+    _tapArmTimer?.cancel();
+    _tapArmTimer = null;
+    _armedTapZone = 0;
+  }
+
+  /// Abandon the current burst without seeking. Grabbing the seek slider has
+  /// to do this: otherwise the buffered skip fires ~300ms later and yanks
+  /// playback to where the taps had been heading instead of where the user
+  /// just scrubbed to.
+  void _cancelPendingSkip() {
+    _skipCommitTimer?.cancel();
+    _skipCommitTimer = null;
+    _skipPreviewTimer?.cancel();
+    _skipPreviewTimer = null;
+    _skipBadgeTimer?.cancel();
+    _skipTarget = null;
+    _skipDirection = 0;
+    _skipCount = 0;
+    _skipAccum = Duration.zero;
+  }
+
+  /// Drop every per-item overlay/pending-seek scrap when the screen switches
+  /// to another movie/episode. Call from inside the caller's setState. A
+  /// pending skip especially must not survive: its target is a position in
+  /// the item that just left, and committing it would seek the NEW one there.
+  void _resetForNewItem() {
+    _cancelPendingSkip();
+    _cancelArmedTap();
+    _dragPosition = null;
+    // Stale shape from the previous item must not leak — the mpv path already
+    // resets its own videoAspect in PlaybackController._play().
+    _nativeVideoAspect = null;
+    _nativeSubtitleCues = null;
   }
 
   // Native ExoPlayer + SurfaceView path for smooth playback on weak boxes —
@@ -205,11 +434,28 @@ class _PlayerScreenState extends State<PlayerScreen>
   int _nativeReconnectAttempt = 0;
   static const int _kMaxNativeReconnects = 5;
 
-  // On-demand only: subtitles for the native path are rendered as a plain
-  // Flutter overlay (see _nativeSubtitleOverlay) instead of through mpv/libass
-  // — ExoPlayer isn't asked to render text tracks at all here, so nothing else
-  // parses timing; loaded via _searchSubtitles().
+  // Subtitles on the native path are rendered as a plain Flutter overlay (see
+  // _nativeSubtitleOverlay), from one of two sources: EXTERNAL SRT/VTT parsed
+  // into [_nativeSubtitleCues] and timed against [_nativeClock], or an
+  // EMBEDDED text track whose current line ExoPlayer pushes at display time
+  // into [_nativeEmbeddedCue] (perfect sync, no Dart-side timing).
   List<SubtitleCue>? _nativeSubtitleCues;
+  final ValueNotifier<String> _nativeEmbeddedCue = ValueNotifier('');
+  // Position clock for the external-cue lookup — its own ValueNotifier so the
+  // overlay follows every 250ms native tick without rebuilding the whole
+  // player (PlaybackController deliberately notifies only once per second).
+  final ValueNotifier<Duration> _nativeClock = ValueNotifier(Duration.zero);
+  StreamSubscription<NativeTracks>? _nativeTracksSub;
+  StreamSubscription<String>? _nativeCuesSub;
+  // 'group:track' of the embedded native selection (persistence + sheet check).
+  String? _nativeSelectedTextId;
+  // Set on any manual pick (track/Fra/external) — the best-effort auto-restore
+  // of the saved choice must never clobber what the user just chose, no matter
+  // how slowly its network fetch lands.
+  bool _userPickedSubtitle = false;
+  // Bumped per item change so a stale in-flight auto-restore for the PREVIOUS
+  // episode/movie can't install its subtitle onto the new one.
+  int _subtitleEpoch = 0;
 
   // Display aspect ratio pushed from the native player (see
   // NativeVideoController.aspectRatioStream) — a SurfaceView has no "fit" of
@@ -270,6 +516,9 @@ class _PlayerScreenState extends State<PlayerScreen>
     PipService.isSupported().then((v) {
       if (mounted && v) setState(() => _pipSupported = true);
     });
+    // Resolved for BOTH modes now — the in-player favorite star needs it on
+    // live too (previously only the on-demand branch set it).
+    _appState = context.read<AppState>();
     if (_isLive) {
       _pc.openLive(
         playlist: widget.playlist,
@@ -279,10 +528,9 @@ class _PlayerScreenState extends State<PlayerScreen>
       );
       _loadEpg();
     } else {
-      // Resolve AppState/DownloadManager NOW — the saveResume callback also
-      // fires from dispose(), where context lookups throw and would abort the
-      // player teardown (leaving audio playing after the screen pops).
-      _appState = context.read<AppState>();
+      // Resolve DownloadManager NOW — the saveResume callback also fires from
+      // dispose(), where context lookups throw and would abort the player
+      // teardown (leaving audio playing after the screen pops).
       _downloads = context.read<DownloadManager>();
       _pc.onDemandCompleted = _onEpisodeCompleted;
       _pc.openOnDemand(
@@ -311,6 +559,18 @@ class _PlayerScreenState extends State<PlayerScreen>
       // error instead of quietly reconnecting.
       _nativeReconnectAttempt = 0;
       _loadEpg();
+    }
+    // A pending skip stops being a preview once the player has actually
+    // landed near it — from here the seek bar follows the real position
+    // again. (No setState needed: the same notification the AnimatedBuilder
+    // is listening to drives the rebuild, and this listener runs first.)
+    final target = _skipTarget;
+    if (target != null &&
+        _skipCommitTimer == null &&
+        (_pc.position - target).abs() <= const Duration(seconds: 3)) {
+      _skipTarget = null;
+      _skipPreviewTimer?.cancel();
+      _skipPreviewTimer = null;
     }
     _arbitrateOverlayFocus();
   }
@@ -438,28 +698,55 @@ class _PlayerScreenState extends State<PlayerScreen>
   /// window, which read as "nothing happens" from a couch. 0.8 (clamp 24-88)
   /// makes each press a clearly visible ~4px step, default size 55 -> 44px.
   Widget _nativeSubtitleOverlay() {
-    final cues = _nativeSubtitleCues;
-    if (cues == null) return const SizedBox.shrink();
-    final delay = Duration(milliseconds: (_pc.subDelaySecs * 1000).round());
-    final cue = activeCue(cues, _pc.position - delay);
-    if (cue == null) return const SizedBox.shrink();
     return Positioned(
       left: 24,
       right: 24,
       bottom: 32,
-      child: Text(
-        cue.text,
-        textAlign: TextAlign.center,
-        style: TextStyle(
-          color: Colors.white,
-          fontSize: (_pc.subFontSize * 0.8).clamp(24, 88),
-          fontWeight: FontWeight.w600,
-          height: 1.3,
-          shadows: const [
-            Shadow(color: Colors.black, blurRadius: 6),
-            Shadow(color: Colors.black, offset: Offset(1, 1)),
-          ],
-        ),
+      child: ValueListenableBuilder<String>(
+        valueListenable: _nativeEmbeddedCue,
+        builder: (context, embedded, _) {
+          return ValueListenableBuilder<Duration>(
+            valueListenable: _nativeClock,
+            builder: (context, pos, _) {
+              String? text;
+              if (embedded.isNotEmpty) {
+                // Embedded track: ExoPlayer pushed this at display time —
+                // inherently synced to the same mux, no user timing applied.
+                text = embedded;
+              } else {
+                final cues = _nativeSubtitleCues;
+                if (cues != null) {
+                  // External file: the same math mpv applies for
+                  // sub-delay/sub-speed — a cue displays while
+                  // (position - delay) / speed falls inside its window.
+                  final effMs = ((pos.inMilliseconds -
+                              _pc.subDelaySecs * 1000) /
+                          _pc.subSpeed)
+                      .round();
+                  text =
+                      activeCue(cues, Duration(milliseconds: effMs))?.text;
+                }
+              }
+              if (text == null || text.isEmpty) {
+                return const SizedBox.shrink();
+              }
+              return Text(
+                text,
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: (_pc.subFontSize * 0.8).clamp(24, 88),
+                  fontWeight: FontWeight.w600,
+                  height: 1.3,
+                  shadows: const [
+                    Shadow(color: Colors.black, blurRadius: 6),
+                    Shadow(color: Colors.black, offset: Offset(1, 1)),
+                  ],
+                ),
+              );
+            },
+          );
+        },
       ),
     );
   }
@@ -488,11 +775,21 @@ class _PlayerScreenState extends State<PlayerScreen>
     _nativeAspectSub = c.aspectRatioStream.listen((ratio) {
       if (mounted) setState(() => _nativeVideoAspect = ratio);
     });
+    // Embedded tracks: lists for the Spor sheet, current line for the overlay.
+    _nativeTracksSub?.cancel();
+    _nativeTracksSub = c.tracksStream.listen((_) {
+      if (mounted) setState(() {});
+    });
+    _nativeCuesSub?.cancel();
+    _nativeCuesSub = c.cuesStream.listen((txt) {
+      _nativeEmbeddedCue.value = txt;
+    });
     if (!_isLive) {
       // Live has no seek bar / position display / play-pause button, so this
       // plumbing is on-demand only.
       _nativePosSub?.cancel();
       _nativePosSub = c.positionStream.listen((p) {
+        _nativeClock.value = p.position;
         if (mounted) _pc.setExternalPosition(p.position, p.duration);
       });
       _pc.externalSeekHandler = (to) => c.seekTo(to);
@@ -622,12 +919,19 @@ class _PlayerScreenState extends State<PlayerScreen>
     _navIdleTimer?.cancel();
     _numberTimer?.cancel();
     _nextTimer?.cancel();
-    _seekDebounce?.cancel();
+    _skipCommitTimer?.cancel();
+    _skipBadgeTimer?.cancel();
+    _skipPreviewTimer?.cancel();
+    _tapArmTimer?.cancel();
     _nativeReconnectTimer?.cancel();
     _nativeStateSub?.cancel();
     _nativeErrSub?.cancel();
     _nativePosSub?.cancel();
     _nativeAspectSub?.cancel();
+    _nativeTracksSub?.cancel();
+    _nativeCuesSub?.cancel();
+    _nativeEmbeddedCue.dispose();
+    _nativeClock.dispose();
     _pc.externalSeekHandler = null;
     _pc.externalPlayPauseHandler = null;
     _pc.removeListener(_onControllerTick);
@@ -640,6 +944,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     _aspectFocus.dispose();
     _tracksFocus.dispose();
     _sleepFocus.dispose();
+    _favFocus.dispose();
     _livePrevFocus.dispose();
     _liveNextFocus.dispose();
     _liveSurfFocus.dispose();
@@ -693,7 +998,7 @@ class _PlayerScreenState extends State<PlayerScreen>
       _season = next.seasonNumber;
       _episodeNum = next.episodeNumber;
       _resumeKey = key;
-      _nativeSubtitleCues = null; // belonged to the episode that just ended
+      _resetForNewItem(); // subtitles/aspect/pending skip belonged to the old episode
     });
     // Prefer an already-downloaded copy — auto-next must not require network
     // just because the CURRENT episode happened to stream (e.g. it was played
@@ -740,7 +1045,7 @@ class _PlayerScreenState extends State<PlayerScreen>
       _title = target.name;
       _searchTitle = target.name;
       _resumeKey = key;
-      _nativeSubtitleCues = null; // belonged to the movie that just left
+      _resetForNewItem(); // subtitles/aspect/pending skip belonged to the old movie
     });
     unawaited(_appState.markWatched(target));
     // Prefer an already-downloaded copy, same reasoning as _playNextEpisode.
@@ -928,9 +1233,11 @@ class _PlayerScreenState extends State<PlayerScreen>
     if (!_isLive &&
         (k == LogicalKeyboardKey.mediaRewind ||
             k == LogicalKeyboardKey.mediaFastForward)) {
-      _pc.seekBy(Duration(
-          seconds: k == LogicalKeyboardKey.mediaRewind ? -30 : 30));
-      _revealControls();
+      // Dedicated ⏪/⏩ keys keep their bigger fixed 30s step, but go through
+      // the same burst accumulator as everything else — held down they used
+      // to fire one un-debounced native seek per key-repeat.
+      _skip(k == LogicalKeyboardKey.mediaRewind ? -1 : 1,
+          step: const Duration(seconds: 30));
       return KeyEventResult.handled;
     }
     if (_isLive &&
@@ -1037,16 +1344,18 @@ class _PlayerScreenState extends State<PlayerScreen>
         return KeyEventResult.handled;
       }
     } else {
-      // Debounced: holding the key fires many KeyRepeatEvents (only KeyUpEvent
-      // is filtered above), and each seekBy was reaching mpv's FIFO-serialized
-      // native seek immediately — one real seek per repeat tick froze playback
-      // for a second-plus after any hold. Buffer the delta and seek once.
+      // Debounced + escalating (see _skip): holding the key fires many
+      // KeyRepeatEvents (only KeyUpEvent is filtered above), and each seekBy
+      // was reaching mpv's FIFO-serialized native seek immediately — one real
+      // seek per repeat tick froze playback for a second-plus after any hold.
+      // Buffer into one seek, and grow the step so a held arrow actually
+      // fast-forwards instead of crawling 10s at a time.
       if (k == LogicalKeyboardKey.arrowLeft) {
-        _seekByDebounced(const Duration(seconds: -10));
+        _skip(-1);
         return KeyEventResult.handled;
       }
       if (k == LogicalKeyboardKey.arrowRight) {
-        _seekByDebounced(const Duration(seconds: 10));
+        _skip(1);
         return KeyEventResult.handled;
       }
     }
@@ -1119,8 +1428,16 @@ class _PlayerScreenState extends State<PlayerScreen>
         focusNode: _focus,
         autofocus: true,
         onKeyEvent: _onKey,
-        child: GestureDetector(
-          onTap: _toggleControls,
+        // The skip zones are a fraction of the player's WIDTH, so the tap
+        // handler needs the real box — MediaQuery would also include whatever
+        // the Scaffold trimmed off.
+        child: LayoutBuilder(builder: (context, constraints) {
+          return GestureDetector(
+          // onTapUp (not onTap) so the tap's x position is available: the
+          // left/right thirds are double-tap skip zones on movies/series, the
+          // middle band is the plain show/hide-the-controls tap. See
+          // _onTapUpAt for the tap/double-tap/spam state machine.
+          onTapUp: (d) => _onTapUpAt(d.localPosition, constraints.maxWidth),
           // Touch shortcut for "switch movie like a channel" — the button
           // pair above covers D-pad/TV; a horizontal swipe is the faster,
           // more natural gesture on phone/tablet. Only wired up when there's
@@ -1147,7 +1464,9 @@ class _PlayerScreenState extends State<PlayerScreen>
                   RepaintBoundary(
                     child: _useNative ? _nativeVideo() : _mediaKitVideo(),
                   ),
-                  if (_useNative && !_isLive && !inPip) _nativeSubtitleOverlay(),
+                  // Not gated on !_isLive anymore: embedded text tracks can
+                  // exist on live streams too now that ExoPlayer pushes cues.
+                  if (_useNative && !inPip) _nativeSubtitleOverlay(),
                   if (_pc.buffering && !_pc.hasError)
                     const Center(child: CircularProgressIndicator()),
                   // The PiP window only shows the bare video.
@@ -1175,6 +1494,9 @@ class _PlayerScreenState extends State<PlayerScreen>
                         ),
                       ),
                     if (_showControls && !_pc.hasError) _overlay(),
+                    // Above the controls bar: while spam-tapping, the badge
+                    // is the thing the user is actually reading.
+                    if (_skipDirection != 0) _skipIndicator(),
                     if (_nextCountdown != null) _autoNextOverlay(),
                     if (_showSurf) _surfDrawer(),
                   ],
@@ -1182,8 +1504,51 @@ class _PlayerScreenState extends State<PlayerScreen>
               );
             },
           ),
-        ),
+        );
+        }),
       ),
+      ),
+    );
+  }
+
+  /// Netflix-style skip badge — shows the running total of the current tap
+  /// burst on the side being skipped, so spam-tapping has visible feedback
+  /// ("10 sek" → "20 sek" → …) before the one real seek is issued.
+  /// [IgnorePointer] matters: it sits over the skip zone it belongs to, and
+  /// must not swallow the very next tap of the burst.
+  Widget _skipIndicator() {
+    final forward = _skipDirection > 0;
+    return Positioned.fill(
+      child: IgnorePointer(
+        child: Align(
+          alignment: forward ? Alignment.centerRight : Alignment.centerLeft,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 40),
+            child: Container(
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 22, vertical: 18),
+              decoration: BoxDecoration(
+                color: Colors.black.withValues(alpha: 0.55),
+                borderRadius: BorderRadius.circular(60),
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(forward ? Icons.fast_forward : Icons.fast_rewind,
+                      color: Colors.white, size: 40),
+                  const SizedBox(height: 4),
+                  Text(
+                    '${_skipAccum.inSeconds} sek',
+                    style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 16,
+                        fontWeight: FontWeight.w600),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -1334,6 +1699,7 @@ class _PlayerScreenState extends State<PlayerScreen>
                     ],
                   ),
                 ),
+                _favoriteButton(),
                 if (_pipSupported)
                   FocusRing(
                     shape: BoxShape.circle,
@@ -1411,7 +1777,10 @@ class _PlayerScreenState extends State<PlayerScreen>
   }
 
   Widget _onDemandBottom() {
-    final pos = _dragPosition ?? _pc.position;
+    // Follows a pending skip burst too (see _displayPosition) — otherwise the
+    // bar sat frozen at the old spot while the badge counted up, and only
+    // jumped once the debounced seek finally landed.
+    final pos = _displayPosition;
     final dur = _pc.duration;
     final max = dur.inMilliseconds.toDouble();
     final value = max <= 0 ? 0.0 : pos.inMilliseconds.clamp(0, dur.inMilliseconds).toDouble();
@@ -1434,8 +1803,13 @@ class _PlayerScreenState extends State<PlayerScreen>
                     // release — dragging fired a synchronous, FIFO-serialized
                     // native seek per pixel, freezing playback for a
                     // second-plus after every scrub.
-                    onChanged: (v) => setState(
-                        () => _dragPosition = Duration(milliseconds: v.toInt())),
+                    onChanged: (v) {
+                      // The scrub is now the user's intent — drop any skip
+                      // burst still waiting to commit (see _cancelPendingSkip).
+                      _cancelPendingSkip();
+                      setState(
+                          () => _dragPosition = Duration(milliseconds: v.toInt()));
+                    },
                     onChangeEnd: (v) {
                       _pc.seek(Duration(milliseconds: v.toInt()));
                       setState(() => _dragPosition = null);
@@ -1456,13 +1830,16 @@ class _PlayerScreenState extends State<PlayerScreen>
                 _circleBtn(Icons.skip_previous, () => _playAdjacentMovie(-1)),
                 const SizedBox(width: 16),
               ],
-              _circleBtn(Icons.replay_10, () => _pc.seekBy(const Duration(seconds: -10))),
+              // Through _skip, not a raw seekBy: mashing these buttons is the
+              // same gesture as spam double-tapping the sides, so it gets the
+              // same accumulate-into-one-seek + escalating step + badge.
+              _circleBtn(Icons.replay_10, () => _skip(-1)),
               const SizedBox(width: 16),
               // Landing spot when OK opens the bar on VOD/series.
               _circleBtn(_pc.isPlaying ? Icons.pause : Icons.play_arrow, _pc.playPause,
                   big: true, focusNode: _controlsFocus),
               const SizedBox(width: 16),
-              _circleBtn(Icons.forward_10, () => _pc.seekBy(const Duration(seconds: 10))),
+              _circleBtn(Icons.forward_10, () => _skip(1)),
               // Manually skip ahead mid-episode — previously the ONLY way to
               // advance was waiting for the episode to finish and the 10s
               // auto-next countdown to fire.
@@ -1549,7 +1926,6 @@ class _PlayerScreenState extends State<PlayerScreen>
   Future<void> _showTracks() => _withIdleSuspended(_showTracksBody);
 
   Future<void> _showTracksBody() async {
-    final tracks = _pc.player.state.tracks;
     await showModalBottomSheet<void>(
       context: context,
       backgroundColor: const Color(0xFF171C26),
@@ -1557,22 +1933,63 @@ class _PlayerScreenState extends State<PlayerScreen>
         return SafeArea(
           child: StatefulBuilder(
             builder: (sheetContext, setSheetState) {
-              return ListView(
+              // Live-updating lists on BOTH backends: mpv probes tracks
+              // asynchronously (a sheet opened early used to show a frozen
+              // empty snapshot forever), and the native player pushes its
+              // lists whenever ExoPlayer reports them.
+              return StreamBuilder<NativeTracks>(
+                initialData: _nativeController?.tracks,
+                stream: _nativeController?.tracksStream,
+                builder: (context, nativeSnap) {
+                  final native = nativeSnap.data ?? const NativeTracks();
+                  return StreamBuilder<Tracks>(
+                    initialData: _pc.player.state.tracks,
+                    stream: _pc.player.stream.tracks,
+                    builder: (context, snap) {
+                      final tracks = snap.data ?? _pc.player.state.tracks;
+                      // Hide mpv's pseudo entries — they rendered as dead
+                      // "Spor auto"/"Spor no" rows ('Fra' already covers off).
+                      final mpvAudio = [
+                        for (final a in tracks.audio)
+                          if (a.id != 'auto' && a.id != 'no') a,
+                      ];
+                      final mpvSubs = [
+                        for (final s in tracks.subtitle)
+                          if (s.id != 'auto' && s.id != 'no') s,
+                      ];
+                      return ListView(
                 shrinkWrap: true,
                 children: [
                   const ListTile(title: Text('Lyd', style: TextStyle(fontWeight: FontWeight.bold))),
-                  for (final a in tracks.audio)
-                    FocusRing(
-                      borderRadius: 8,
-                      child: ListTile(
-                        dense: true,
-                        title: Text(_trackLabel(a.title, a.language, a.id)),
-                        onTap: () {
-                          _pc.player.setAudioTrack(a);
-                          Navigator.pop(sheetContext);
-                        },
+                  if (_useNative)
+                    for (final a in native.audio)
+                      FocusRing(
+                        borderRadius: 8,
+                        child: ListTile(
+                          dense: true,
+                          title: Text(_trackLabel(a.label, a.language, a.id)),
+                          trailing: a.selected
+                              ? const Icon(Icons.check, size: 18)
+                              : null,
+                          onTap: () {
+                            unawaited(_nativeController?.setAudioTrack(a));
+                            Navigator.pop(sheetContext);
+                          },
+                        ),
+                      )
+                  else
+                    for (final a in mpvAudio)
+                      FocusRing(
+                        borderRadius: 8,
+                        child: ListTile(
+                          dense: true,
+                          title: Text(_trackLabel(a.title, a.language, a.id)),
+                          onTap: () {
+                            _pc.player.setAudioTrack(a);
+                            Navigator.pop(sheetContext);
+                          },
+                        ),
                       ),
-                    ),
                   const Divider(),
                   const ListTile(title: Text('Undertekster', style: TextStyle(fontWeight: FontWeight.bold))),
                   if (!_isLive && _searchTitle != null)
@@ -1603,15 +2020,17 @@ class _PlayerScreenState extends State<PlayerScreen>
                       autofocus: isTvMode,
                       title: const Text('Fra'),
                       onTap: () {
+                        _userPickedSubtitle = true;
                         _pc.player.setSubtitleTrack(SubtitleTrack.no());
-                        // The native path never told mpv about these cues in
-                        // the first place — mpv has nothing to turn off, so
-                        // the call above is a no-op there. Clear our own
-                        // overlay state directly instead.
                         if (_useNative) {
+                          unawaited(_nativeController?.disableTextTrack());
+                          _nativeSelectedTextId = null;
+                          _nativeEmbeddedCue.value = '';
                           setState(() => _nativeSubtitleCues = null);
-                          _pc.setExternalSubtitleTitle(null);
                         }
+                        // Both paths: the "Aktiv: <sprog>" label used to keep
+                        // lying on the mpv path after turning subtitles off.
+                        _pc.setExternalSubtitleTitle(null);
                         // Also forget the saved choice — otherwise turning
                         // subtitles off here would still come back next time
                         // this item is reopened (see _autoLoadSavedSubtitle).
@@ -1622,18 +2041,69 @@ class _PlayerScreenState extends State<PlayerScreen>
                       },
                     ),
                   ),
-                  for (final s in tracks.subtitle)
-                    FocusRing(
-                      borderRadius: 8,
-                      child: ListTile(
-                        dense: true,
-                        title: Text(_trackLabel(s.title, s.language, s.id)),
-                        onTap: () {
-                          _pc.player.setSubtitleTrack(s);
-                          Navigator.pop(sheetContext);
-                        },
+                  if (_useNative)
+                    for (final s in native.text)
+                      FocusRing(
+                        borderRadius: 8,
+                        child: ListTile(
+                          dense: true,
+                          title: Text(_trackLabel(s.label, s.language, s.id)),
+                          trailing: s.id == _nativeSelectedTextId
+                              ? const Icon(Icons.check, size: 18)
+                              : null,
+                          onTap: () {
+                            _userPickedSubtitle = true;
+                            unawaited(_nativeController?.setTextTrack(s));
+                            _nativeSelectedTextId = s.id;
+                            // External parsed cues would double-draw under
+                            // the pushed embedded line.
+                            setState(() => _nativeSubtitleCues = null);
+                            _pc.setExternalSubtitleTitle(null);
+                            if (_resumeKey != null) {
+                              unawaited(_appState.saveSubtitleChoice(
+                                _resumeKey!,
+                                SubtitleChoice(
+                                  '',
+                                  _trackLabel(s.label, s.language, s.id),
+                                  kind: 'embedded',
+                                  trackId: s.id,
+                                ),
+                              ));
+                            }
+                            Navigator.pop(sheetContext);
+                          },
+                        ),
+                      )
+                  else
+                    for (final s in mpvSubs)
+                      FocusRing(
+                        borderRadius: 8,
+                        child: ListTile(
+                          dense: true,
+                          title: Text(_trackLabel(s.title, s.language, s.id)),
+                          onTap: () {
+                            // Mark BEFORE selecting: the auto-restore of a
+                            // saved external choice used to land seconds
+                            // later and silently clobber this embedded pick —
+                            // the "I select a track and nothing happens" bug.
+                            _userPickedSubtitle = true;
+                            _pc.player.setSubtitleTrack(s);
+                            _pc.setExternalSubtitleTitle(null);
+                            if (_resumeKey != null) {
+                              unawaited(_appState.saveSubtitleChoice(
+                                _resumeKey!,
+                                SubtitleChoice(
+                                  '',
+                                  _trackLabel(s.title, s.language, s.id),
+                                  kind: 'embedded',
+                                  trackId: s.id,
+                                ),
+                              ));
+                            }
+                            Navigator.pop(sheetContext);
+                          },
+                        ),
                       ),
-                    ),
                   const Divider(),
                   const ListTile(
                     title: Text('Undertekst-justering',
@@ -1649,8 +2119,8 @@ class _PlayerScreenState extends State<PlayerScreen>
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Row(
-                          children: const [
+                        const Row(
+                          children: [
                             Icon(Icons.format_size, size: 20, color: Colors.white70),
                             SizedBox(width: 10),
                             Text('Størrelse'),
@@ -1689,12 +2159,12 @@ class _PlayerScreenState extends State<PlayerScreen>
                     ),
                   ),
                   Padding(
-                    padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+                    padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Row(
-                          children: const [
+                        const Row(
+                          children: [
                             Icon(Icons.schedule, size: 20, color: Colors.white70),
                             SizedBox(width: 10),
                             Text('Timing'),
@@ -1706,18 +2176,19 @@ class _PlayerScreenState extends State<PlayerScreen>
                               style: TextStyle(fontSize: 11, color: Colors.white54)),
                         ),
                         const SizedBox(height: 6),
+                        // Two step sizes: ±0.25s was the ONLY step before,
+                        // which made fixing a 5-10s offset a 20-40 press
+                        // ordeal. Tap the value to reset offset AND drift.
                         Row(
                           children: [
-                            FocusRing(
-                              shape: BoxShape.circle,
-                              child: IconButton(
-                                icon: const Icon(Icons.remove),
-                                onPressed: () async {
-                                  await _pc.nudgeSubtitleDelay(-0.25);
-                                  setSheetState(() {});
-                                },
-                              ),
-                            ),
+                            _timingBtn(sheetContext, '−5 s', () async {
+                              await _pc.nudgeSubtitleDelay(-5);
+                              setSheetState(() {});
+                            }),
+                            _timingBtn(sheetContext, '−0,5', () async {
+                              await _pc.nudgeSubtitleDelay(-0.5);
+                              setSheetState(() {});
+                            }),
                             Expanded(
                               child: Center(
                                 child: FocusRing(
@@ -1734,60 +2205,197 @@ class _PlayerScreenState extends State<PlayerScreen>
                                 ),
                               ),
                             ),
-                            FocusRing(
-                              shape: BoxShape.circle,
-                              child: IconButton(
-                                icon: const Icon(Icons.add),
-                                onPressed: () async {
-                                  await _pc.nudgeSubtitleDelay(0.25);
-                                  setSheetState(() {});
-                                },
+                            _timingBtn(sheetContext, '+0,5', () async {
+                              await _pc.nudgeSubtitleDelay(0.5);
+                              setSheetState(() {});
+                            }),
+                            _timingBtn(sheetContext, '+5 s', () async {
+                              await _pc.nudgeSubtitleDelay(5);
+                              setSheetState(() {});
+                            }),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                  // Linear drift correction — a constant offset can't fix a
+                  // file authored for another framerate/cut ("5s early at one
+                  // point, 10s late later in the same movie"). Hidden on the
+                  // embedded-native selection, where cues are inherently
+                  // synced by ExoPlayer itself.
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Row(
+                          children: [
+                            Icon(Icons.speed, size: 20, color: Colors.white70),
+                            SizedBox(width: 10),
+                            Text('Glidning'),
+                          ],
+                        ),
+                        const Padding(
+                          padding: EdgeInsets.only(left: 30),
+                          child: Text(
+                              'Brug hvis teksten glider mere og mere gennem filmen',
+                              style: TextStyle(fontSize: 11, color: Colors.white54)),
+                        ),
+                        const SizedBox(height: 6),
+                        Row(
+                          children: [
+                            _timingBtn(sheetContext, '−', () async {
+                              await _pc.nudgeSubtitleSpeed(-0.005);
+                              setSheetState(() {});
+                            }),
+                            Expanded(
+                              child: Center(
+                                child: Text(
+                                  '${_pc.subSpeed >= 1 ? '+' : ''}${((_pc.subSpeed - 1) * 100).toStringAsFixed(1)} %',
+                                  style: const TextStyle(fontSize: 14),
+                                ),
                               ),
                             ),
+                            _timingBtn(sheetContext, '+', () async {
+                              await _pc.nudgeSubtitleSpeed(0.005);
+                              setSheetState(() {});
+                            }),
                           ],
                         ),
                       ],
                     ),
                   ),
                 ],
+                      );
+                    },
+                  );
+                },
               );
             },
           ),
         );
       },
     );
+    // Sheet closed: persist the calibration onto the saved choice (if any) so
+    // a painstakingly synced subtitle is still synced on the next open.
+    if (_resumeKey != null) {
+      unawaited(_appState.saveSubtitleTiming(
+          _resumeKey!, _pc.subDelaySecs, _pc.subSpeed));
+    }
   }
 
-  /// If the user previously picked an external subtitle for this exact item
-  /// (movie or episode — see _searchSubtitlesBody), silently reload the same
-  /// one instead of requiring the whole search+pick flow again every time
-  /// they come back to it (e.g. via "Fortsæt"). Best-effort: a dead/expired
-  /// link should never surface an error or block playback starting.
+  /// Compact labeled step button for the timing rows.
+  Widget _timingBtn(BuildContext context, String label, VoidCallback onTap) {
+    return FocusRing(
+      borderRadius: 8,
+      child: TextButton(
+        style: TextButton.styleFrom(
+          minimumSize: const Size(44, 40),
+          padding: const EdgeInsets.symmetric(horizontal: 10),
+        ),
+        onPressed: onTap,
+        child: Text(label),
+      ),
+    );
+  }
+
+  /// If the user previously picked a subtitle for this exact item (external
+  /// file OR embedded track — see SubtitleChoice), silently restore it — along
+  /// with the persisted timing calibration — instead of requiring the whole
+  /// flow again every time they come back to it. Best-effort: a dead link or
+  /// missing track never surfaces an error or blocks playback.
+  ///
+  /// Called once per item (open / next-episode / adjacent-movie); doubles as
+  /// the per-item reset point for all subtitle state. Two clobber guards
+  /// learned the hard way: [_subtitleEpoch] kills a stale in-flight restore
+  /// when the item changes under it, and [_userPickedSubtitle] makes a manual
+  /// pick always win over this automatic one.
   Future<void> _autoLoadSavedSubtitle(String? key) async {
+    final epoch = ++_subtitleEpoch;
+    _userPickedSubtitle = false;
+    _nativeSelectedTextId = null;
+    _nativeEmbeddedCue.value = '';
+    if (_nativeSubtitleCues != null && mounted) {
+      setState(() => _nativeSubtitleCues = null);
+    }
     if (key == null) return;
     final choice = await _appState.subtitleChoiceFor(key);
-    if (choice == null || !mounted) return;
-    // Called right after openOnDemand() — wait for the item to genuinely
-    // start loading before asking mpv/the native path to attach a subtitle
-    // track. Issuing that immediately, before anything is loaded, risks the
-    // command being silently dropped rather than queued (the manual "Søg
-    // eksterne undertekster" flow never hits this because the user can only
-    // reach it once playback is already well underway).
+    if (choice == null) return;
+    bool stale() =>
+        !mounted || epoch != _subtitleEpoch || _userPickedSubtitle;
+    if (stale()) return;
+    // Wait for the item to genuinely start loading before attaching anything —
+    // issued too early, the command is silently dropped rather than queued.
     await _waitForPlaybackReady();
-    if (!mounted) return;
+    if (stale()) return;
     try {
-      final search = SubtitleSearch(_appState.repository.http);
-      final srt = await search.fetch(choice.url);
-      if (!mounted) return;
-      if (_useNative) {
-        setState(() => _nativeSubtitleCues = parseSubtitle(srt));
-        _pc.setExternalSubtitleTitle(choice.lang);
+      if (choice.kind == 'embedded') {
+        if (_useNative) {
+          final t = await _waitForNativeTextTrack(choice.trackId, epoch);
+          if (t == null || stale()) return;
+          await _nativeController?.setTextTrack(t);
+          _nativeSelectedTextId = t.id;
+        } else {
+          final t = await _waitForMpvSubtitleTrack(choice.trackId, epoch);
+          if (t == null || stale()) return;
+          await _pc.player.setSubtitleTrack(t);
+        }
       } else {
-        await _pc.loadExternalSubtitle(srt, title: choice.lang);
+        final search = SubtitleSearch(_appState.repository.http);
+        final srt = await search.fetch(choice.url);
+        if (stale()) return;
+        if (_useNative) {
+          setState(() => _nativeSubtitleCues = parseSubtitle(srt));
+          _pc.setExternalSubtitleTitle(choice.lang);
+        } else {
+          await _pc.loadExternalSubtitle(srt, title: choice.lang);
+        }
+      }
+      // The calibration is part of the choice — restoring the file but
+      // forgetting the painstaking sync made "gem valget" feel broken.
+      if (choice.offsetSecs != 0 || choice.speed != 1.0) {
+        await _pc.applySubtitleTiming(choice.offsetSecs, choice.speed);
       }
     } catch (_) {
       // Best-effort only — see doc comment above.
     }
+  }
+
+  /// Polls until the native player has reported its embedded text tracks,
+  /// then resolves the saved id — or null if the track no longer exists.
+  Future<NativeTrackInfo?> _waitForNativeTextTrack(String? id, int epoch) async {
+    for (var i = 0; i < 40; i++) {
+      if (!mounted || epoch != _subtitleEpoch) return null;
+      final list = _nativeController?.tracks.text ?? const <NativeTrackInfo>[];
+      if (list.isNotEmpty) {
+        for (final t in list) {
+          if (t.id == id) return t;
+        }
+        return null;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+    }
+    return null;
+  }
+
+  /// Same idea for the mpv path: waits for mpv's track probe to surface real
+  /// embedded tracks (the list starts as pseudo 'auto'/'no' only).
+  Future<SubtitleTrack?> _waitForMpvSubtitleTrack(String? id, int epoch) async {
+    for (var i = 0; i < 40; i++) {
+      if (!mounted || epoch != _subtitleEpoch) return null;
+      final list = [
+        for (final t in _pc.player.state.tracks.subtitle)
+          if (t.id != 'auto' && t.id != 'no') t,
+      ];
+      if (list.isNotEmpty) {
+        for (final t in list) {
+          if (t.id == id) return t;
+        }
+        return null;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+    }
+    return null;
   }
 
   /// Resolves once the current item has a genuine first position tick (or
@@ -1854,21 +2462,39 @@ class _PlayerScreenState extends State<PlayerScreen>
       return;
     }
 
+    // Number the alternatives per language ("Dansk 1 af 4") — timing problems
+    // are usually a mismatched RELEASE, and the real fix is trying another
+    // file for the same language; identical unnumbered rows hid that option.
+    final list = results!;
+    final totals = <String, int>{};
+    for (final r in list) {
+      totals[r.langLabel] = (totals[r.langLabel] ?? 0) + 1;
+    }
+    final seen = <String, int>{};
+    final labels = <String>[
+      for (final r in list)
+        (totals[r.langLabel] ?? 1) > 1
+            ? '${r.langLabel} ${seen[r.langLabel] = (seen[r.langLabel] ?? 0) + 1} af ${totals[r.langLabel]}'
+            : r.langLabel,
+    ];
+
     // Pick one from the list (grouped by language, preferred first).
-    final picked = await showModalBottomSheet<SubtitleResult>(
+    final pickedIndex = await showModalBottomSheet<int>(
       context: context,
       backgroundColor: const Color(0xFF171C26),
       builder: (sheetContext) {
-        final list = results!;
         return SafeArea(
           child: ListView.builder(
             shrinkWrap: true,
             itemCount: list.length + 1,
             itemBuilder: (sheetContext, i) {
               if (i == 0) {
-                return ListTile(
-                  title: Text('Undertekster (${list.length})',
-                      style: const TextStyle(fontWeight: FontWeight.bold)),
+                return const ListTile(
+                  title: Text('Undertekster',
+                      style: TextStyle(fontWeight: FontWeight.bold)),
+                  subtitle: Text(
+                      'Passer timingen ikke? Prøv en anden af samme sprog.',
+                      style: TextStyle(fontSize: 11)),
                 );
               }
               final r = list[i - 1];
@@ -1877,9 +2503,9 @@ class _PlayerScreenState extends State<PlayerScreen>
                 child: ListTile(
                   dense: true,
                   leading: const Icon(Icons.subtitles_outlined, size: 20),
-                  title: Text(r.langLabel),
+                  title: Text(labels[i - 1]),
                   subtitle: Text(r.lang, style: const TextStyle(fontSize: 11)),
-                  onTap: () => Navigator.pop(sheetContext, r),
+                  onTap: () => Navigator.pop(sheetContext, i - 1),
                 ),
               );
             },
@@ -1887,27 +2513,35 @@ class _PlayerScreenState extends State<PlayerScreen>
         );
       },
     );
-    if (picked == null || !mounted) return;
+    if (pickedIndex == null || !mounted) return;
+    final picked = list[pickedIndex];
+    final pickedLabel = labels[pickedIndex];
 
     try {
       final srt = await search.fetch(picked.url);
       if (!mounted) return;
+      _userPickedSubtitle = true;
       if (_useNative) {
         // The native ExoPlayer path never asks mpv/libass to render text
         // tracks — parse the cues ourselves and drive a plain overlay from
-        // the position stream instead (see _nativeSubtitleOverlay).
+        // the position stream instead (see _nativeSubtitleOverlay). An active
+        // embedded track would double-draw under it — turn it off.
+        unawaited(_nativeController?.disableTextTrack());
+        _nativeSelectedTextId = null;
+        _nativeEmbeddedCue.value = '';
         setState(() => _nativeSubtitleCues = parseSubtitle(srt));
-        _pc.setExternalSubtitleTitle(picked.langLabel);
+        _pc.setExternalSubtitleTitle(pickedLabel);
       } else {
-        await _pc.loadExternalSubtitle(srt, title: picked.langLabel);
+        await _pc.loadExternalSubtitle(srt, title: pickedLabel);
       }
       // Remembered per item (movie/episode) so reopening it later — e.g. via
       // "Fortsæt" — silently reloads this same choice instead of requiring
       // the whole search+pick flow again. See _autoLoadSavedSubtitle.
       if (_resumeKey != null) {
-        unawaited(_appState.saveSubtitleChoice(_resumeKey!, picked.url, picked.langLabel));
+        unawaited(_appState.saveSubtitleChoice(
+            _resumeKey!, SubtitleChoice(picked.url, pickedLabel)));
       }
-      if (mounted) _snack('Undertekster indlæst (${picked.langLabel}).');
+      if (mounted) _snack('Undertekster indlæst ($pickedLabel).');
     } catch (e) {
       if (mounted) {
         _snack(e.toString().replaceFirst('Exception: ', ''));

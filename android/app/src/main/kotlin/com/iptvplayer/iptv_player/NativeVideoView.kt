@@ -6,10 +6,14 @@ import android.os.Handler
 import android.os.Looper
 import android.view.SurfaceView
 import android.view.View
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.TrackSelectionOverride
+import androidx.media3.common.Tracks
 import androidx.media3.common.VideoSize
+import androidx.media3.common.text.CueGroup
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
@@ -72,7 +76,9 @@ class NativeVideoView(
                     ),
                 )
             }
-            if (positionLoopRunning) positionHandler.postDelayed(this, 500)
+            // 250ms (was 500): this clock also times the Dart-side external
+            // subtitle overlay, where a coarse tick reads as sloppy cue timing.
+            if (positionLoopRunning) positionHandler.postDelayed(this, 250)
         }
     }
 
@@ -104,6 +110,14 @@ class NativeVideoView(
             .build()
         exo.setVideoSurfaceView(surfaceView)
         exo.playWhenReady = true
+        // Embedded text tracks are OFF until Dart explicitly selects one —
+        // without this, ExoPlayer's DefaultTrackSelector may auto-pick a text
+        // track by device locale, and now that onCues is wired below it would
+        // suddenly draw subtitles nobody asked for.
+        exo.trackSelectionParameters = exo.trackSelectionParameters
+            .buildUpon()
+            .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+            .build()
         exo.addListener(object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
                 channel.invokeMethod(
@@ -129,6 +143,51 @@ class NativeVideoView(
                 channel.invokeMethod(
                     "error",
                     mapOf("code" to error.errorCodeName, "transient" to isTransient),
+                )
+            }
+
+            override fun onTracksChanged(tracks: Tracks) {
+                // Push the real embedded track lists to Dart — the tracks
+                // sheet used to read the IDLE media_kit player's list on this
+                // path, which only ever contains pseudo 'auto'/'no' entries.
+                fun list(type: Int): List<Map<String, Any?>> {
+                    val out = mutableListOf<Map<String, Any?>>()
+                    tracks.groups.forEachIndexed { g, group ->
+                        if (group.type != type) return@forEachIndexed
+                        for (t in 0 until group.length) {
+                            if (!group.isTrackSupported(t)) continue
+                            val f = group.getTrackFormat(t)
+                            out.add(
+                                mapOf(
+                                    "group" to g,
+                                    "track" to t,
+                                    "language" to f.language,
+                                    "label" to f.label,
+                                    "selected" to group.isTrackSelected(t),
+                                ),
+                            )
+                        }
+                    }
+                    return out
+                }
+                channel.invokeMethod(
+                    "tracks",
+                    mapOf(
+                        "text" to list(C.TRACK_TYPE_TEXT),
+                        "audio" to list(C.TRACK_TYPE_AUDIO),
+                    ),
+                )
+            }
+
+            override fun onCues(cueGroup: CueGroup) {
+                // Delivered by ExoPlayer AT display time — perfectly synced to
+                // the decoder's clock, no Dart-side cue timing needed for
+                // embedded tracks. Empty string = clear the overlay.
+                channel.invokeMethod(
+                    "cues",
+                    cueGroup.cues.mapNotNull { it.text?.toString() }
+                        .filter { it.isNotBlank() }
+                        .joinToString("\n"),
                 )
             }
 
@@ -164,6 +223,17 @@ class NativeVideoView(
         // prepare(), there's no window where playback briefly starts from 0
         // before our seek lands (the same class of race the mpv/media_kit
         // `Media.start` fix avoids on the on-demand media_kit path).
+        // New item: drop the previous item's text-track override and disable
+        // text again — a type-level "enabled" left over from the old item
+        // would otherwise let the selector auto-pick a text track by locale
+        // on the NEXT episode (subtitles nobody asked for). Dart re-selects
+        // the saved track for the new item explicitly.
+        p.trackSelectionParameters = p.trackSelectionParameters
+            .buildUpon()
+            .clearOverridesOfType(C.TRACK_TYPE_TEXT)
+            .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+            .build()
+        channel.invokeMethod("cues", "")
         if (startPositionMs > 0L) {
             p.setMediaItem(MediaItem.fromUri(uri), startPositionMs)
         } else {
@@ -171,6 +241,21 @@ class NativeVideoView(
         }
         p.prepare()
         p.playWhenReady = true
+    }
+
+    /** Select track [track] of group [group] (indexes as pushed in "tracks"). */
+    private fun selectTrack(type: Int, group: Int?, track: Int?) {
+        val p = player ?: return
+        if (group == null || track == null) return
+        val groups = p.currentTracks.groups
+        if (group < 0 || group >= groups.size) return
+        val g = groups[group]
+        if (g.type != type || track < 0 || track >= g.length) return
+        p.trackSelectionParameters = p.trackSelectionParameters
+            .buildUpon()
+            .setTrackTypeDisabled(type, false)
+            .setOverrideForType(TrackSelectionOverride(g.mediaTrackGroup, track))
+            .build()
     }
 
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
@@ -188,6 +273,29 @@ class NativeVideoView(
             "play" -> { player?.play(); result.success(null) }
             "pause" -> { player?.pause(); result.success(null) }
             "stop" -> { player?.stop(); result.success(null) }
+            "setTextTrack" -> {
+                selectTrack(C.TRACK_TYPE_TEXT, call.argument<Number>("group")?.toInt(),
+                    call.argument<Number>("track")?.toInt())
+                result.success(null)
+            }
+            "disableTextTrack" -> {
+                player?.let { p ->
+                    p.trackSelectionParameters = p.trackSelectionParameters
+                        .buildUpon()
+                        .clearOverridesOfType(C.TRACK_TYPE_TEXT)
+                        .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+                        .build()
+                }
+                // ExoPlayer doesn't emit an empty CueGroup when text is
+                // disabled mid-cue — clear the Dart overlay explicitly.
+                channel.invokeMethod("cues", "")
+                result.success(null)
+            }
+            "setAudioTrack" -> {
+                selectTrack(C.TRACK_TYPE_AUDIO, call.argument<Number>("group")?.toInt(),
+                    call.argument<Number>("track")?.toInt())
+                result.success(null)
+            }
             else -> result.notImplemented()
         }
     }
