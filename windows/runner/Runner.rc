@@ -95,7 +95,13 @@ BEGIN
             VALUE "InternalName", "iptv_player" "\0"
             VALUE "LegalCopyright", "Copyright (C) 2026 com.iptvplayer. All rights reserved." "\0"
             VALUE "OriginalFilename", "iptv_player.exe" "\0"
-            VALUE "ProductName", "IPTV Player" "\0"
+            // ProductName is NOT just a label: path_provider on Windows derives the
+            // app-data folder from CompanyName\ProductName, i.e.
+            // %APPDATA%\com.iptvplayer\iptv_player. Renaming it (v1.2.0, briefly)
+            // moved the app to an empty folder and "lost" every saved source,
+            // favorite and download. Keep it as the storage key for good;
+            // FileDescription is the human-readable name Task Manager shows.
+            VALUE "ProductName", "iptv_player" "\0"
             VALUE "ProductVersion", VERSION_AS_STRING "\0"
         END
     END
