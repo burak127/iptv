@@ -69,7 +69,9 @@ class LiveScreen extends StatelessWidget {
       // categories on a provider refresh, since it was last watched — fall
       // back to the full list so auto-resume still fires (just without the
       // original category context) instead of silently not resuming at all.
-      channels = state.channels;
+      // The gated "Alle kanaler" list, not the raw catalog — a locked adult
+      // channel must not auto-open at boot either.
+      channels = state.channelsInCategory(null);
       idx = channels.indexWhere((c) => c.id == id);
       if (idx < 0) return;
     }

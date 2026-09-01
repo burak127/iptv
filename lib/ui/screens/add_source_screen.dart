@@ -3,6 +3,7 @@ import 'package:provider/provider.dart';
 
 import '../../models/iptv_source.dart';
 import '../../services/pairing_server.dart';
+import '../../services/stream_url_builder.dart';
 import '../../state/app_state.dart';
 import '../../theme.dart';
 import '../widgets/focusable_card.dart';
@@ -58,8 +59,7 @@ class _AddSourceScreenState extends State<AddSourceScreen> {
   static String _normalizeUrl(String raw) {
     final v = raw.trim();
     if (v.isEmpty) return v;
-    if (v.startsWith('http://') || v.startsWith('https://')) return v;
-    return 'http://$v';
+    return normalizeUrlScheme(v);
   }
 
   String? _validateUrl(String? value) {
@@ -119,13 +119,23 @@ class _AddSourceScreenState extends State<AddSourceScreen> {
     }
 
     final state = context.read<AppState>();
+    final previousActive = state.active;
     await state.addSource(source);
     if (!mounted) return;
 
     if (state.liveError != null) {
+      final message = state.liveError!;
+      // Roll back: the failed source used to stay saved AND active — the
+      // working provider was hijacked, and a corrected retry then added a
+      // second copy of the broken one.
+      await state.removeSource(source);
+      if (previousActive != null && state.active?.id != previousActive.id) {
+        await state.setActive(previousActive);
+      }
+      if (!mounted) return;
       setState(() => _saving = false);
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(state.liveError!)),
+        SnackBar(content: Text(message)),
       );
       return;
     }

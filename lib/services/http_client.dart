@@ -78,7 +78,12 @@ class IptvHttpClient {
         final client = _client; // re-read each attempt (may have been retired)
         try {
           final res = await client.get(url, headers: headers).timeout(timeout);
-          final transient = res.statusCode >= 500 && res.statusCode < 600;
+          // 512 is the Xtream "account expired/blocked" code (see
+          // IptvErrors) — retrying it only burns the single allowed
+          // connection and delays the real message.
+          final transient = res.statusCode >= 500 &&
+              res.statusCode < 600 &&
+              res.statusCode != 512;
           if (transient && attempt < retries) {
             attempt++;
             await Future<void>.delayed(Duration(milliseconds: 500 << (attempt - 1)));

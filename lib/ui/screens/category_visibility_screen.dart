@@ -23,7 +23,24 @@ class _CategoryVisibilityScreenState extends State<CategoryVisibilityScreen> {
   final _filterCtrl = TextEditingController();
 
   @override
+  void initState() {
+    super.initState();
+    // Filter off the CONTROLLER, not TextField.onChanged: on TV the text is
+    // typed through TvKeyboard, which writes straight into the controller —
+    // and Flutter never fires onChanged for programmatic edits, so this
+    // search box silently did nothing at all with a remote.
+    _filterCtrl.addListener(_onFilterChanged);
+  }
+
+  void _onFilterChanged() {
+    if (_filterCtrl.text != _filter) {
+      setState(() => _filter = _filterCtrl.text);
+    }
+  }
+
+  @override
   void dispose() {
+    _filterCtrl.removeListener(_onFilterChanged);
     _filterCtrl.dispose();
     super.dispose();
   }
@@ -94,7 +111,6 @@ class _CategoryVisibilityScreenState extends State<CategoryVisibilityScreen> {
                     hintText: 'Søg kategori…',
                     isDense: true,
                   ),
-                  onChanged: (v) => setState(() => _filter = v),
                 ),
               ),
             ),

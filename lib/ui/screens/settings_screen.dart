@@ -26,6 +26,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
   // every AppState.notifyListeners() rebuild.
   late Future<bool> _hasPinFuture;
   late Future<XtreamUserInfo?> _accountFuture;
+  // Source the memoized account future belongs to — the IndexedStack keeps
+  // this screen alive across a source switch, so "Konto" kept showing the
+  // previous provider's status/expiry.
+  String? _accountSourceId;
 
   // Android 14's separate full-screen-intent gate (see MainActivity.kt) —
   // only relevant/shown once "Start automatisk" is actually on, so this is
@@ -39,6 +43,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final s = context.read<AppState>();
     _hasPinFuture = s.progress.hasPin();
     _accountFuture = s.accountInfo();
+    _accountSourceId = s.active?.id;
     if (isTvMode) _refreshFullScreenIntentCheck();
   }
 
@@ -56,6 +61,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
     final active = state.active;
+    if (active?.id != _accountSourceId) {
+      _accountSourceId = active?.id;
+      _accountFuture = state.accountInfo();
+    }
 
     return Scaffold(
       appBar: AppBar(title: const Text('Indstillinger')),
@@ -353,7 +362,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           const _SectionHeader('Om'),
           const ListTile(
             leading: Icon(Icons.info_outline),
-            title: Text('IPTV Player · v0.2'),
+            title: Text('IPTV Player · v1.2'),
           ),
         ],
       ),
@@ -451,23 +460,35 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 title: Text(title),
                 // DpadEscape: Down must reach the dialog buttons instead of
                 // being eaten by the field's caret movement on TV.
+                // TvTextInput: on TV, OK opens the in-app TvKeyboard (its
+                // digit row) instead of the system IME the app documents as
+                // D-pad-unusable — the PIN could not be typed with a remote.
                 content: DpadEscape(
-                    child: TextField(
+                    child: TvTextInput(
                   controller: controller,
-                  autofocus: true,
-                  keyboardType: TextInputType.number,
-                  obscureText: true,
-                  maxLength: 4,
-                  inputFormatters: [
-                    FilteringTextInputFormatter.digitsOnly,
-                    LengthLimitingTextInputFormatter(4),
-                  ],
-                  decoration: InputDecoration(
-                    labelText: '4-cifret PIN',
-                    counterText: '',
-                    errorText: error,
+                  obscure: true,
+                  autofocus: isTvMode,
+                  onSubmitted: () =>
+                      _submitPin(context, controller, setLocal, (e) => error = e),
+                  builder: (context, node) => TextField(
+                    controller: controller,
+                    focusNode: node,
+                    autofocus: !isTvMode,
+                    keyboardType: TextInputType.number,
+                    obscureText: true,
+                    maxLength: 4,
+                    inputFormatters: [
+                      FilteringTextInputFormatter.digitsOnly,
+                      LengthLimitingTextInputFormatter(4),
+                    ],
+                    decoration: InputDecoration(
+                      labelText: '4-cifret PIN',
+                      counterText: '',
+                      errorText: error,
+                    ),
+                    onSubmitted: (_) => _submitPin(
+                        context, controller, setLocal, (e) => error = e),
                   ),
-                  onSubmitted: (_) => _submitPin(context, controller, setLocal, (e) => error = e),
                 )),
                 actions: [
                   TextButton(

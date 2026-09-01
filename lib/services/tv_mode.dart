@@ -15,10 +15,10 @@ bool isTvMode = false;
 bool directHwVideo = false;
 const String kDirectHwVideoKey = 'direct_hw_video';
 
-/// When true, LIVE playback on Android TV uses a native ExoPlayer + SurfaceView
-/// (a hardware overlay, like TiviMate) instead of media_kit's Flutter texture —
-/// far smoother on weak Amlogic boxes. Opt-in per device (some boxes/layouts
-/// have platform-view quirks). Live only; VOD/subtitles stay on media_kit.
+/// When true, playback on Android TV — live TV AND movies/series — uses a
+/// native ExoPlayer + SurfaceView (a hardware overlay, like TiviMate) instead
+/// of media_kit's Flutter texture — far smoother on weak Amlogic boxes. Opt-in
+/// per device (some boxes/layouts have platform-view quirks).
 bool nativePlayer = false;
 const String kNativePlayerKey = 'native_player';
 

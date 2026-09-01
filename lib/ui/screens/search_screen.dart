@@ -53,6 +53,11 @@ class _SearchScreenState extends State<SearchScreen> {
   @override
   void initState() {
     super.initState();
+    // Search off the CONTROLLER, not TextField.onChanged: on TV the query is
+    // typed through TvKeyboard, which writes straight into the controller —
+    // and Flutter never fires onChanged for programmatic edits, so nothing
+    // searched until "FÆRDIG" was pressed. The listener covers both paths.
+    _controller.addListener(_onControllerChanged);
     // Warm the VOD + series indexes so search spans movies and series too
     // (live is already loaded for the active source).
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -65,9 +70,12 @@ class _SearchScreenState extends State<SearchScreen> {
   @override
   void dispose() {
     _debounce?.cancel();
+    _controller.removeListener(_onControllerChanged);
     _controller.dispose();
     super.dispose();
   }
+
+  void _onControllerChanged() => _onChanged(_controller.text);
 
   void _onChanged(String value) {
     _debounce?.cancel();
@@ -128,7 +136,6 @@ class _SearchScreenState extends State<SearchScreen> {
               controller: _controller,
               focusNode: node,
               textInputAction: TextInputAction.search,
-              onChanged: _onChanged,
               onSubmitted: _runSearch,
               decoration: InputDecoration(
                 hintText: 'Søg i kanaler, film og serier',
@@ -188,15 +195,16 @@ class _SearchScreenState extends State<SearchScreen> {
     switch (item.kind) {
       case MediaKind.live:
         final channel = item as LiveChannel;
-        state.markWatched(channel);
         // Open the channel INSIDE its own category list — not as a list of
         // one — so up/down zapping works exactly like tapping it in that
         // category. Fall back to the full channel list, then to the single
         // channel, if the category can't be resolved (e.g. provider refresh
         // moved it since the search index was built).
-        var playlist = state.channelsInCategory(channel.categoryId);
+        String? watchedFrom = channel.categoryId;
+        var playlist = state.channelsInCategory(watchedFrom);
         var index = playlist.indexWhere((c) => c.id == channel.id);
         if (index < 0) {
+          watchedFrom = null; // "Alle kanaler"
           playlist = state.channels;
           index = playlist.indexWhere((c) => c.id == channel.id);
         }
@@ -204,6 +212,9 @@ class _SearchScreenState extends State<SearchScreen> {
           playlist = [channel];
           index = 0;
         }
+        // Record the list it's actually playing in (not the Live tab's
+        // unrelated selection) so "resume last channel" rebuilds this one.
+        state.markWatchedInCategory(channel, watchedFrom);
         Navigator.of(context).push(MaterialPageRoute(
           builder: (_) => PlayerScreen.live(
             source: state.active!,

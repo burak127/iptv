@@ -76,7 +76,7 @@ class _DownloadTile extends StatelessWidget {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Text(item.title,
+                  Text(item.displayTitle,
                       maxLines: 2, overflow: TextOverflow.ellipsis),
                   const SizedBox(height: 6),
                   _status(context, item),
@@ -173,13 +173,18 @@ class _DownloadTile extends StatelessWidget {
   // playback via PlaybackController.
   Future<void> _play(BuildContext context) async {
     final app = context.read<AppState>();
-    // A local file needs no live source — resolve one, else synthesize (so
-    // offline playback works even with zero configured sources).
+    // A local file needs no live source — but the item's OWN source comes
+    // first, so its resume point and subtitle choice are read and saved
+    // under the source it was downloaded from (the player namespaces
+    // persistence by the source it's handed). The active source used to win
+    // here, which mixed up progress across providers. Fall back to whatever
+    // exists, else synthesize (offline playback with zero configured
+    // sources still works).
     IptvSource resolveSource() {
-      if (app.active != null) return app.active!;
       for (final s in app.sources) {
         if (s.id == item.sourceId) return s;
       }
+      if (app.active != null) return app.active!;
       if (app.sources.isNotEmpty) return app.sources.first;
       return IptvSource.m3u(
         id: item.sourceId,
@@ -189,16 +194,21 @@ class _DownloadTile extends StatelessWidget {
       );
     }
 
-    final resume = await app.resumeFor(item.key);
+    final source = resolveSource();
+    final resume = await app.resumeFor(item.key, sourceId: source.id);
     if (!context.mounted) return;
     Navigator.of(context).push(MaterialPageRoute(
       builder: (_) => PlayerScreen.onDemand(
-        source: resolveSource(),
+        source: source,
         url: item.localPath,
-        title: item.title,
+        title: item.episodeLabel,
         resumeKey: item.key,
         startAt: resume != null ? Duration(seconds: resume.positionSecs) : null,
-        searchTitle: item.title,
+        // Series context (when known) so the subtitle search looks up the
+        // SERIES + S/E, not the bare episode title as a movie.
+        searchTitle: item.seriesName ?? item.title,
+        season: item.season,
+        episode: item.episode,
       ),
     ));
   }

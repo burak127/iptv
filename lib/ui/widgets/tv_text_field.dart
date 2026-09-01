@@ -52,7 +52,11 @@ class TvTextInput extends StatefulWidget {
     this.refocusSignal,
     this.controller,
     this.onSubmitted,
+    this.obscure = false,
   });
+
+  /// Passed to [TvKeyboard] — dots instead of text in its preview (PIN).
+  final bool obscure;
 
   /// Builds the field, wiring the given node to its `focusNode`.
   final Widget Function(BuildContext context, FocusNode fieldNode) builder;
@@ -154,6 +158,7 @@ class _TvTextInputState extends State<TvTextInput> {
       builder: (_) => TvKeyboard(
         controller: widget.controller!,
         onDone: widget.onSubmitted,
+        obscure: widget.obscure,
       ),
     ).whenComplete(() {
       // The sheet is its own FocusScope — hand focus back to the shell so the

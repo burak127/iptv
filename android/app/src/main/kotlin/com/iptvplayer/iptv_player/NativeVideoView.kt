@@ -139,7 +139,11 @@ class NativeVideoView(
                 // setSource() will never fix -- without this classification, a
                 // malformed stream or missing codec/DRM support was retried forever
                 // every 2s with no way to ever tell the user it would never succeed.
-                val isTransient = error.errorCode in 2000..2999
+                // BEHIND_LIVE_WINDOW (1002) sits outside the I/O band but
+                // Media3's documented recovery is exactly a re-prepare —
+                // which the 2s reconnect already does.
+                val isTransient = error.errorCode in 2000..2999 ||
+                    error.errorCode == PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW
                 channel.invokeMethod(
                     "error",
                     mapOf("code" to error.errorCodeName, "transient" to isTransient),
@@ -234,13 +238,29 @@ class NativeVideoView(
             .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
             .build()
         channel.invokeMethod("cues", "")
-        if (startPositionMs > 0L) {
-            p.setMediaItem(MediaItem.fromUri(uri), startPositionMs)
-        } else {
-            p.setMediaItem(MediaItem.fromUri(uri))
+        try {
+            if (startPositionMs > 0L) {
+                p.setMediaItem(MediaItem.fromUri(uri), startPositionMs)
+            } else {
+                p.setMediaItem(MediaItem.fromUri(uri))
+            }
+            p.prepare()
+            p.playWhenReady = true
+        } catch (e: IllegalStateException) {
+            // DefaultMediaSourceFactory throws synchronously when no module
+            // can handle the URL's type (an HLS/DASH stream without the
+            // matching media3 module on the classpath). Unreported that was
+            // a silent black screen, and thrown out of init it even killed
+            // the platform view's creation. Surface it as a permanent error
+            // — deferred a beat so a call from init lands after Dart has
+            // attached its MethodCallHandler.
+            positionHandler.postDelayed({
+                channel.invokeMethod(
+                    "error",
+                    mapOf("code" to "UNSUPPORTED_SOURCE", "transient" to false),
+                )
+            }, 300)
         }
-        p.prepare()
-        p.playWhenReady = true
     }
 
     /** Select track [track] of group [group] (indexes as pushed in "tracks"). */

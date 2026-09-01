@@ -15,22 +15,39 @@ import 'focus_ring.dart';
 /// machinery already used everywhere else in this UI, so it's guaranteed
 /// reachable and navigable regardless of the box/ROM's IME quirks.
 class TvKeyboard extends StatefulWidget {
-  const TvKeyboard({super.key, required this.controller, this.onDone});
+  const TvKeyboard({
+    super.key,
+    required this.controller,
+    this.onDone,
+    this.obscure = false,
+  });
 
   final TextEditingController controller;
   final VoidCallback? onDone;
+
+  /// Show dots instead of the text in the live preview (PIN entry on a TV
+  /// everyone in the room can see).
+  final bool obscure;
 
   @override
   State<TvKeyboard> createState() => _TvKeyboardState();
 }
 
 class _TvKeyboardState extends State<TvKeyboard> {
+  // The symbols row exists because real inputs need it: an Xtream host is
+  // "http://host:8080" (':' '/'), an M3U link is "…/get.php?u=x&p=y" ('?'
+  // '=' '&'), passwords mix case and '_'/'@'. Without them the add-source
+  // form on a TV could not accept most providers at all.
   static const _rows = [
     ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'],
     ['q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p'],
     ['a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l'],
     ['z', 'x', 'c', 'v', 'b', 'n', 'm', '-', '.'],
+    [':', '/', '?', '=', '&', '_', '@', '#', '%', '+'],
   ];
+
+  /// Shift state — letters render and insert as uppercase while on.
+  bool _upper = false;
 
   void _insert(String ch) {
     final v = widget.controller.value;
@@ -86,7 +103,9 @@ class _TvKeyboardState extends State<TvKeyboard> {
                   child: Align(
                     alignment: Alignment.centerLeft,
                     child: Text(
-                      v.text.isEmpty ? ' ' : v.text,
+                      v.text.isEmpty
+                          ? ' '
+                          : (widget.obscure ? '•' * v.text.length : v.text),
                       style: const TextStyle(fontSize: 18, color: Colors.white),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
@@ -101,7 +120,11 @@ class _TvKeyboardState extends State<TvKeyboard> {
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
                       for (final ch in _rows[i])
-                        _key(ch, () => _insert(ch), autofocus: i == 0 && ch == '1'),
+                        _key(
+                          _upper ? ch.toUpperCase() : ch,
+                          () => _insert(_upper ? ch.toUpperCase() : ch),
+                          autofocus: i == 0 && ch == '1',
+                        ),
                     ],
                   ),
                 ),
@@ -110,6 +133,8 @@ class _TvKeyboardState extends State<TvKeyboard> {
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
+                    _wideKey(_upper ? 'abc' : 'ABC',
+                        () => setState(() => _upper = !_upper)),
                     _wideKey('MELLEMRUM', () => _insert(' ')),
                     _key('', _backspace, icon: Icons.backspace_outlined),
                     _wideKey('FÆRDIG', () {

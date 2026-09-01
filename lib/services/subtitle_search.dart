@@ -36,10 +36,12 @@ class SubtitleSearch {
   static const _langPriority = ['dan', 'da', 'tur', 'tr', 'eng', 'en'];
 
   /// Strip provider noise ("FR - Name (2025)" → "Name (2025)") so the catalog
-  /// search actually matches.
+  /// search actually matches. Only the "-" / "|" separators providers use —
+  /// ":" was in the class too and turned "CSI: Miami" into "Miami", resolving
+  /// the wrong film's subtitles.
   static String cleanTitle(String raw) {
     var t = raw.trim();
-    t = t.replaceFirst(RegExp(r'^[A-Z]{2,3}\s*[-|:]\s*'), '');
+    t = t.replaceFirst(RegExp(r'^[A-Z]{2,3}\s*[-|]\s*'), '');
     t = t.replaceAll(RegExp(r'\s+'), ' ').trim();
     return t;
   }

@@ -75,6 +75,11 @@ dependencies {
     // the hardware decoder straight onto a SurfaceView overlay (like TiviMate),
     // bypassing Flutter's texture composite that stutters on weak Amlogic boxes.
     implementation("androidx.media3:media3-exoplayer:1.4.1")
+    // Without the HLS module DefaultMediaSourceFactory throws on any .m3u8
+    // URL — every HLS-format source and most plain M3U playlists were a
+    // silent black screen on the native player (the exception even escaped
+    // the view's init and killed the platform view's creation).
+    implementation("androidx.media3:media3-exoplayer-hls:1.4.1")
     implementation("androidx.media3:media3-datasource:1.4.1")
     // NotificationCompat/ActivityCompat/ContextCompat for BootReceiver's
     // full-screen-intent fallback and its notification-permission request.

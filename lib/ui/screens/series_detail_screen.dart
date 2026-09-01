@@ -236,6 +236,7 @@ class _SeriesDetailScreenState extends State<SeriesDetailScreen> {
         separatorBuilder: (_, __) => const SizedBox(height: 8),
         itemBuilder: (context, i) => _EpisodeRow(
           episode: episodes[i],
+          seriesName: widget.series.name,
           autofocus: i == 0,
           onTap: () => _play(episodes[i]),
         ),
@@ -326,11 +327,13 @@ class _Header extends StatelessWidget {
 class _EpisodeRow extends StatelessWidget {
   const _EpisodeRow({
     required this.episode,
+    required this.seriesName,
     required this.onTap,
     this.autofocus = false,
   });
 
   final Episode episode;
+  final String seriesName;
   final VoidCallback onTap;
   final bool autofocus;
 
@@ -462,6 +465,9 @@ class _EpisodeRow extends StatelessWidget {
           kind: 'series',
           title: episode.title,
           image: episode.poster,
+          seriesName: seriesName,
+          season: episode.seasonNumber,
+          episode: episode.episodeNumber,
           sourceId: source.id,
           remoteUrl: StreamUrlBuilder.episode(source, episode),
           userAgent: source.userAgent ?? kDefaultUserAgent,

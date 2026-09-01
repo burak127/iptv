@@ -166,12 +166,33 @@ class XtreamClient {
         .getJson(_api({'action': 'get_series_info', 'series_id': seriesId}), userAgent: _ua);
     final episodesRaw = (data is Map) ? data['episodes'] : null;
     final seasons = <Season>[];
+    // Panels disagree on the shape: usually {"1": [...], "2": [...]}, but
+    // some emit a LIST — either a list of per-season lists, or one flat
+    // list of episode objects carrying their own "season". Both used to
+    // yield zero seasons ("Ingen afsnit") for a perfectly good series.
+    Map<dynamic, dynamic> bySeason;
     if (episodesRaw is Map) {
-      final keys = episodesRaw.keys.toList()
+      bySeason = episodesRaw;
+    } else if (episodesRaw is List) {
+      bySeason = <dynamic, dynamic>{};
+      for (var i = 0; i < episodesRaw.length; i++) {
+        final e = episodesRaw[i];
+        if (e is List) {
+          bySeason[i + 1] = e;
+        } else if (e is Map) {
+          final s = asIntOrNull(e['season']) ?? 1;
+          (bySeason[s] ??= <dynamic>[]).add(e);
+        }
+      }
+    } else {
+      bySeason = const {};
+    }
+    if (bySeason.isNotEmpty) {
+      final keys = bySeason.keys.toList()
         ..sort((a, b) => (int.tryParse('$a') ?? 0).compareTo(int.tryParse('$b') ?? 0));
       for (final k in keys) {
         final seasonNum = int.tryParse('$k') ?? 0;
-        final eps = asList(episodesRaw[k])
+        final eps = asList(bySeason[k])
             .whereType<Map>()
             .map((m) {
               final info = (m['info'] is Map) ? m['info'] as Map : const {};
@@ -213,8 +234,8 @@ class XtreamClient {
               unixTimestamp: asIntOrNull(m['stop_timestamp']));
           if (start == null || end == null) return null;
           return EpgEntry(
-            title: _b64(asStringOrNull(m['title'])) ?? 'Program',
-            description: _b64(asStringOrNull(m['description'])),
+            title: decodeEpgText(asStringOrNull(m['title'])) ?? 'Program',
+            description: decodeEpgText(asStringOrNull(m['description'])),
             startUtc: start,
             endUtc: end,
           );
@@ -237,18 +258,33 @@ class XtreamClient {
 
   /// Xtream EPG titles are base64 on some panels and plaintext on others.
   /// Only decode when the string genuinely looks like base64 AND decodes to
-  /// clean UTF-8 without control-char garbage; otherwise return it verbatim.
-  static String? _b64(String? s) {
+  /// clean text; otherwise return it verbatim. Short plain titles ("Kids",
+  /// "WWE", "News") are valid base64 too and used to come back as 2-3 bytes
+  /// of punctuation garbage — hence the length/padding gate and the
+  /// "mostly letters" check on the decoded result. Public for the tests.
+  static String? decodeEpgText(String? s) {
     if (s == null) return null;
     final raw = s.trim();
     if (raw.isEmpty) return null;
     if (!RegExp(r'^[A-Za-z0-9+/=_-]+$').hasMatch(raw)) return raw;
+    // Real base64 producers emit padded strings; a title this short is a word.
+    if (raw.length < 12 || raw.length % 4 != 0) return raw;
     try {
       final decoded = utf8.decode(base64.decode(base64.normalize(raw)));
-      final hasControl = decoded.runes.any(
-        (r) => r < 0x20 && r != 0x09 && r != 0x0a && r != 0x0d,
-      );
-      return hasControl ? raw : decoded;
+      if (decoded.isEmpty) return raw;
+      var good = 0;
+      for (final r in decoded.runes) {
+        final isControl = r < 0x20 && r != 0x09 && r != 0x0a && r != 0x0d;
+        if (isControl) return raw;
+        final isLetterish = (r >= 0x30 && r <= 0x39) ||
+            (r >= 0x41 && r <= 0x5a) ||
+            (r >= 0x61 && r <= 0x7a) ||
+            r == 0x20 ||
+            r > 0x7f; // æøå and every other non-ASCII letter
+        if (isLetterish) good++;
+      }
+      // Decoded garbage is mostly punctuation; real text is mostly letters.
+      return good * 10 >= decoded.runes.length * 6 ? decoded : raw;
     } catch (_) {
       return raw;
     }

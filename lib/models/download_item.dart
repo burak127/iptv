@@ -14,6 +14,15 @@ class DownloadItem {
   final String kind; // 'vod' | 'series'
   final String title;
   final String? image;
+
+  /// Series context for an episode ('series' kind): the series name plus
+  /// season/episode numbers — what external-subtitle search needs (it used
+  /// to search for the bare episode title, "Pilot", as a MOVIE) and what the
+  /// Downloads list shows so the row isn't just "Pilot". Null for movies and
+  /// for entries persisted before these fields existed.
+  final String? seriesName;
+  final int? season;
+  final int? episode;
   final String sourceId;
   final String remoteUrl;
   final String userAgent;
@@ -34,6 +43,9 @@ class DownloadItem {
     required this.userAgent,
     required this.ext,
     this.image,
+    this.seriesName,
+    this.season,
+    this.episode,
     this.localPath = '',
     this.receivedBytes = 0,
     this.totalBytes = 0,
@@ -44,11 +56,23 @@ class DownloadItem {
   double get progress =>
       totalBytes > 0 ? (receivedBytes / totalBytes).clamp(0.0, 1.0) : 0.0;
 
+  /// "S1E2 · Pilot" for an episode with known numbering, else the bare title.
+  String get episodeLabel => (season != null && episode != null)
+      ? 'S${season}E$episode · $title'
+      : title;
+
+  /// What the Downloads list shows: "Series · S1E2 · Pilot" for an episode.
+  String get displayTitle =>
+      seriesName != null ? '$seriesName · $episodeLabel' : title;
+
   Map<String, dynamic> toJson() => {
         'key': key,
         'kind': kind,
         'title': title,
         'image': image,
+        'seriesName': seriesName,
+        'season': season,
+        'episode': episode,
         'sourceId': sourceId,
         'remoteUrl': remoteUrl,
         'userAgent': userAgent,
@@ -65,6 +89,9 @@ class DownloadItem {
         kind: j['kind'] as String,
         title: j['title'] as String,
         image: j['image'] as String?,
+        seriesName: j['seriesName'] as String?,
+        season: j['season'] as int?,
+        episode: j['episode'] as int?,
         sourceId: j['sourceId'] as String,
         remoteUrl: j['remoteUrl'] as String,
         userAgent: j['userAgent'] as String,

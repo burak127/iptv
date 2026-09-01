@@ -206,10 +206,10 @@ button{width:100%;margin-top:22px;padding:15px;border:none;border-radius:10px;ba
 <input type="hidden" name="type" id="type" value="m3u">
 <label>Navn (valgfrit)</label><input name="name" placeholder="Min udbyder">
 <div id="m3uFields">
-<label>M3U URL</label><input name="m3uUrl" inputmode="url" placeholder="http://.../get.php?...">
+<label>M3U URL</label><input name="m3uUrl" inputmode="url" autocapitalize="none" autocorrect="off" placeholder="http://.../get.php?...">
 </div>
 <div id="xFields" class="hidden">
-<label>Server (host)</label><input name="host" inputmode="url" placeholder="http://server:8080">
+<label>Server (host)</label><input name="host" inputmode="url" autocapitalize="none" autocorrect="off" placeholder="http://server:8080">
 <label>Brugernavn</label><input name="username" autocapitalize="none" autocomplete="off">
 <label>Adgangskode</label><input name="password" autocapitalize="none" autocomplete="off">
 </div>

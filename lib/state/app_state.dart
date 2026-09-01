@@ -249,6 +249,12 @@ class AppState extends ChangeNotifier {
     _liveGen++;
     _vodGen++;
     _seriesGen++;
+    // The cancelled loads' `finally` blocks skip their flag reset (wrong
+    // generation), so clear them here — otherwise the Søg tab spun forever
+    // after switching from a slow Xtream source to an M3U one.
+    liveLoading = false;
+    vodLoading = false;
+    seriesLoading = false;
     liveCategories = [];
     channels = [];
     _liveByCat = {};
@@ -362,10 +368,15 @@ class AppState extends ChangeNotifier {
   /// a channel was last watched in, without needing to mutate
   /// [liveCategoryId] (and disturb the Live tab's own browsing state) first.
   List<LiveChannel> channelsInCategory(String? categoryId) {
-    if (categoryId == kFavoritesCategoryId) {
-      return channels.where((c) => isFavorite(MediaKind.live, c.id)).toList();
-    }
     final adult = adultLocked ? _adultIdsOf(liveCategories) : const <String>{};
+    if (categoryId == kFavoritesCategoryId) {
+      // Gated too — a starred adult channel walked straight past the
+      // parental lock through this filter (same for movies/series below).
+      return channels
+          .where((c) =>
+              isFavorite(MediaKind.live, c.id) && !adult.contains(c.categoryId))
+          .toList();
+    }
     if (categoryId == null) {
       if (_hiddenLiveCategories.isEmpty && adult.isEmpty) return channels;
       return channels
@@ -534,10 +545,13 @@ class AppState extends ChangeNotifier {
   }
 
   List<Movie> get visibleMovies {
-    if (vodCategoryId == kFavoritesCategoryId) {
-      return movies.where((m) => isFavorite(MediaKind.vod, m.id)).toList();
-    }
     final adult = adultLocked ? _adultIdsOf(vodCategories) : const <String>{};
+    if (vodCategoryId == kFavoritesCategoryId) {
+      return movies
+          .where((m) =>
+              isFavorite(MediaKind.vod, m.id) && !adult.contains(m.categoryId))
+          .toList();
+    }
     if (vodCategoryId == null) {
       if (_hiddenVodCategories.isEmpty && adult.isEmpty) return movies;
       return movies
@@ -583,10 +597,14 @@ class AppState extends ChangeNotifier {
   }
 
   List<Series> get visibleSeries {
-    if (seriesCategoryId == kFavoritesCategoryId) {
-      return series.where((s) => isFavorite(MediaKind.series, s.id)).toList();
-    }
     final adult = adultLocked ? _adultIdsOf(seriesCategories) : const <String>{};
+    if (seriesCategoryId == kFavoritesCategoryId) {
+      return series
+          .where((s) =>
+              isFavorite(MediaKind.series, s.id) &&
+              !adult.contains(s.categoryId))
+          .toList();
+    }
     if (seriesCategoryId == null) {
       if (_hiddenSeriesCategories.isEmpty && adult.isEmpty) return series;
       return series
@@ -623,20 +641,33 @@ class AppState extends ChangeNotifier {
 
   bool get hasFavorites => _favorites.isNotEmpty;
 
-  Future<void> markWatched(MediaItem item) async {
+  Future<void> markWatched(MediaItem item) => _markWatched(item, liveCategoryId);
+
+  /// [markWatched] for a live channel opened from OUTSIDE the Live tab
+  /// (search results), where the list it plays in is the channel's own
+  /// category rather than whatever the Live tab currently has selected.
+  /// Records THAT category so "resume last channel" rebuilds the same zap
+  /// list — plain [markWatched] stored the Live tab's unrelated selection,
+  /// the resumed channel wasn't in it, and the resume fell back to the full
+  /// unfiltered list.
+  Future<void> markWatchedInCategory(LiveChannel channel, String? categoryId) =>
+      _markWatched(channel, categoryId);
+
+  Future<void> _markWatched(MediaItem item, String? watchedFromCategory) async {
     final s = active;
     if (s == null) return;
     if (item.kind == MediaKind.live) {
       lastLiveChannelId = item.id;
-      // Capture the category the user was actually browsing when they
-      // tapped this channel, so "resume last channel" can rebuild the same
-      // filtered playlist (and therefore the same next/prev zap order)
-      // instead of always falling back to the full "Alle kanaler" list.
-      lastLiveCategoryId = liveCategoryId;
+      // Capture the category the channel was actually opened from, so
+      // "resume last channel" can rebuild the same filtered playlist (and
+      // therefore the same next/prev zap order) instead of always falling
+      // back to the full "Alle kanaler" list.
+      lastLiveCategoryId = watchedFromCategory;
       try {
         final prefs = await SharedPreferences.getInstance();
         await prefs.setString('last_live_${s.id}', item.id);
-        await prefs.setString('last_live_cat_${s.id}', liveCategoryId ?? '');
+        await prefs.setString(
+            'last_live_cat_${s.id}', watchedFromCategory ?? '');
       } catch (_) {/* best-effort */}
     }
     await _progress.pushRecent(
@@ -653,43 +684,54 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<ResumePoint?> resumeFor(String itemKey) async {
-    final s = active;
-    if (s == null) return null;
-    return _progress.resume(s.id, itemKey);
+  /// Source namespace for resume/subtitle persistence. Callers that know
+  /// which source an item belongs to (the player has its `source`, a
+  /// download carries its `sourceId`) pass it explicitly — otherwise a
+  /// download from source B played while source A is active read and wrote
+  /// its progress under A. Defaults to the active source.
+  String? _progressSourceId(String? sourceId) => sourceId ?? active?.id;
+
+  Future<ResumePoint?> resumeFor(String itemKey, {String? sourceId}) async {
+    final sid = _progressSourceId(sourceId);
+    if (sid == null) return null;
+    return _progress.resume(sid, itemKey);
   }
 
-  Future<void> saveResume(String itemKey, int positionSecs, int durationSecs) async {
-    final s = active;
-    if (s == null) return;
-    await _progress.setResume(s.id, itemKey, positionSecs, durationSecs);
+  Future<void> saveResume(String itemKey, int positionSecs, int durationSecs,
+      {String? sourceId}) async {
+    final sid = _progressSourceId(sourceId);
+    if (sid == null) return;
+    await _progress.setResume(sid, itemKey, positionSecs, durationSecs);
   }
 
-  Future<SubtitleChoice?> subtitleChoiceFor(String itemKey) async {
-    final s = active;
-    if (s == null) return null;
-    return _progress.subtitleChoice(s.id, itemKey);
+  Future<SubtitleChoice?> subtitleChoiceFor(String itemKey,
+      {String? sourceId}) async {
+    final sid = _progressSourceId(sourceId);
+    if (sid == null) return null;
+    return _progress.subtitleChoice(sid, itemKey);
   }
 
-  Future<void> saveSubtitleChoice(String itemKey, SubtitleChoice choice) async {
-    final s = active;
-    if (s == null) return;
-    await _progress.setSubtitleChoice(s.id, itemKey, choice);
+  Future<void> saveSubtitleChoice(String itemKey, SubtitleChoice choice,
+      {String? sourceId}) async {
+    final sid = _progressSourceId(sourceId);
+    if (sid == null) return;
+    await _progress.setSubtitleChoice(sid, itemKey, choice);
   }
 
   /// Persist the timing calibration (offset + drift factor) onto the item's
   /// existing subtitle choice, if any.
   Future<void> saveSubtitleTiming(
-      String itemKey, double offsetSecs, double speed) async {
-    final s = active;
-    if (s == null) return;
-    await _progress.setSubtitleTiming(s.id, itemKey, offsetSecs, speed);
+      String itemKey, double offsetSecs, double speed,
+      {String? sourceId}) async {
+    final sid = _progressSourceId(sourceId);
+    if (sid == null) return;
+    await _progress.setSubtitleTiming(sid, itemKey, offsetSecs, speed);
   }
 
-  Future<void> clearSubtitleChoice(String itemKey) async {
-    final s = active;
-    if (s == null) return;
-    await _progress.clearSubtitleChoice(s.id, itemKey);
+  Future<void> clearSubtitleChoice(String itemKey, {String? sourceId}) async {
+    final sid = _progressSourceId(sourceId);
+    if (sid == null) return;
+    await _progress.clearSubtitleChoice(sid, itemKey);
   }
 
   // ---------------- search ----------------

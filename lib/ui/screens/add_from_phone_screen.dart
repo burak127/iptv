@@ -6,6 +6,7 @@ import 'package:qr_flutter/qr_flutter.dart';
 
 import '../../models/iptv_source.dart';
 import '../../services/pairing_server.dart';
+import '../../services/stream_url_builder.dart';
 import '../../state/app_state.dart';
 import '../widgets/focus_ring.dart';
 
@@ -79,10 +80,8 @@ class _AddFromPhoneScreenState extends State<AddFromPhoneScreen> {
     } else {
       var url = (f['m3uUrl'] ?? '').trim();
       if (url.isEmpty) return false;
-      // Tolerate scheme-less URLs pasted from the phone.
-      if (!url.startsWith('http://') && !url.startsWith('https://')) {
-        url = 'http://$url';
-      }
+      // Tolerate scheme-less (and "Http://"-capitalised) URLs from the phone.
+      url = normalizeUrlScheme(url);
       // An M3U link with embedded Xtream credentials becomes an Xtream source
       // (survives get.php blocks + unlocks Film/Serier/Guide).
       source = IptvSource.xtreamFromM3uUrl(

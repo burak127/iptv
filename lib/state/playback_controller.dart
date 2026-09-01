@@ -14,6 +14,36 @@ import '../services/tv_mode.dart';
 
 enum PlaybackMode { live, onDemand }
 
+/// Picture-format modes for the "Billedformat" button.
+///
+/// The old contain → cover → fill cycle is visually IDENTICAL for the single
+/// most common case — a 16:9 stream on a 16:9 screen (every TV box, most
+/// monitors) — which is exactly why the button was reported as "doing
+/// nothing" three times (bug-001/004/008) while "working" on the 16:10
+/// tablet. Three fixes targeted the sizing mechanism; the mechanism was fine.
+/// The zoom/wide modes change the picture even then, and are what IPTV
+/// viewers actually reach for: SD channels routinely broadcast a 4:3 picture
+/// pillarboxed inside a 16:9 frame.
+enum AspectMode {
+  /// Whole frame visible, black bars where the shapes differ.
+  auto('Auto'),
+
+  /// Crop the pillarboxed 4:3 centre out to fill a 16:9 screen (TV "Zoom").
+  zoom('Zoom 4:3'),
+
+  /// Stretch the 4:3 centre horizontally to fill the width, no crop (TV "Wide").
+  wide('Bred 4:3 → 16:9'),
+
+  /// Scale to cover the screen, keeping the shape, cropping the overflow.
+  fill('Fyld skærmen'),
+
+  /// Distort to the screen's exact shape.
+  stretch('Stræk');
+
+  const AspectMode(this.label);
+  final String label;
+}
+
 /// Owns the media_kit player lifecycle so the player screen stays a thin view.
 /// Handles single-connection discipline (debounced zap + stop-before-open),
 /// auto-reconnect for live, resume persistence for on-demand, sleep timer and
@@ -128,6 +158,14 @@ class PlaybackController extends ChangeNotifier {
   int _index = 0;
   int get index => _index;
   List<LiveChannel> get playlist => _live;
+
+  /// The index actually OPENED (settled after the zap debounce) — [index] is
+  /// the mid-zap selection. Drives "last watched channel" persistence.
+  int get playingIndex => _playingIndex;
+  LiveChannel? get playingChannel =>
+      (_playingIndex >= 0 && _playingIndex < _live.length)
+          ? _live[_playingIndex]
+          : null;
   LiveChannel? get currentChannel =>
       (_index >= 0 && _index < _live.length) ? _live[_index] : null;
 
@@ -146,7 +184,28 @@ class PlaybackController extends ChangeNotifier {
   int reconnectAttempt = 0;
   Duration position = Duration.zero;
   Duration duration = Duration.zero;
-  BoxFit fit = BoxFit.contain;
+
+  /// How the decoded frame is mapped onto the screen — see [AspectMode].
+  /// Session-only, like the old BoxFit was.
+  AspectMode aspectMode = AspectMode.auto;
+
+  /// The BoxFit the backend applies for the current mode. Zoom/wide sit on
+  /// top of a plain contain fit as a centred scale — see [aspectScaleX] /
+  /// [aspectScaleY]; the player screen applies that part identically on both
+  /// backends.
+  BoxFit get fit => switch (aspectMode) {
+        AspectMode.auto || AspectMode.zoom || AspectMode.wide => BoxFit.contain,
+        AspectMode.fill => BoxFit.cover,
+        AspectMode.stretch => BoxFit.fill,
+      };
+
+  /// Horizontal scale applied over the contain-fitted frame. 4/3 blows the
+  /// centre 4:3 region of a 16:9 frame out to the full width.
+  double get aspectScaleX =>
+      (aspectMode == AspectMode.zoom || aspectMode == AspectMode.wide) ? 4 / 3 : 1;
+
+  /// Vertical scale: zoom keeps the shape (crops top/bottom); wide doesn't.
+  double get aspectScaleY => aspectMode == AspectMode.zoom ? 4 / 3 : 1;
   /// width/height of the current video, mpv-reported (see constructor). Null
   /// until the first frame's params arrive, or for audio-only content.
   double? videoAspect;
@@ -322,6 +381,13 @@ class PlaybackController extends ChangeNotifier {
       // player screen feeds to the SurfaceView player. media_kit stays idle.
       _lastUrl = url;
       _externalPlaying = true; // fresh item always starts playing
+      // mpv's stop() emits a position 0 that resets these for the next item;
+      // nothing does that here, so the previous episode's position/duration
+      // lingered until ExoPlayer's first tick — the seek bar showed the old
+      // spot, and worse, the saved-subtitle restore's "has playback started"
+      // check (position > 0) passed instantly and attached to the wrong item.
+      position = Duration.zero;
+      duration = Duration.zero;
       externalSubtitleTitle = null; // belongs to the previous item, not this one
       // Timing calibration belongs to the previous item too — the mpv branch
       // resets it in _play(), which this branch never reaches, so a delay
@@ -471,6 +537,10 @@ class PlaybackController extends ChangeNotifier {
       _externalPlaying = !_externalPlaying;
       notifyListeners();
       externalPlayPauseHandler?.call(_externalPlaying);
+      // ExoPlayer's state stream doesn't fire on play/pause (it stays READY),
+      // so the wakelock has to follow the intent from here — otherwise a
+      // paused movie kept the TV awake indefinitely.
+      setExternalPlaying(_externalPlaying);
     } else {
       _player.playOrPause();
     }
@@ -669,8 +739,8 @@ class PlaybackController extends ChangeNotifier {
 
   // ---------------- fit / sleep timer ----------------
   void cycleFit() {
-    const order = [BoxFit.contain, BoxFit.cover, BoxFit.fill];
-    fit = order[(order.indexOf(fit) + 1) % order.length];
+    const values = AspectMode.values;
+    aspectMode = values[(aspectMode.index + 1) % values.length];
     notifyListeners();
   }
 
@@ -685,12 +755,27 @@ class PlaybackController extends ChangeNotifier {
       if (rem <= Duration.zero) {
         t.cancel();
         sleepRemaining = null;
-        _player.pause();
+        _pauseForSleep();
       } else {
         sleepRemaining = rem;
       }
       notifyListeners();
     });
+  }
+
+  /// Sleep-timer pause, routed to whichever backend is actually playing.
+  /// `_player.pause()` alone only ever reached mpv — on the native ExoPlayer
+  /// path (live AND on-demand on TV, i.e. exactly where a sleep timer gets
+  /// used) the timer expired without pausing anything.
+  void _pauseForSleep() {
+    if (_externalVideo) {
+      _externalPlaying = false;
+      externalPlayPauseHandler?.call(false);
+      setExternalPlaying(false);
+      notifyListeners();
+    } else {
+      _player.pause();
+    }
   }
 
   @override

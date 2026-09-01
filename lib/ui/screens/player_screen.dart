@@ -302,6 +302,10 @@ class _PlayerScreenState extends State<PlayerScreen>
     _skipTarget = _pc.clampSeek(base + delta * direction);
     _revealControls(); // also setState()s, so the badge + seek bar redraw
 
+    // A fresh input supersedes the previous commit's safety timer — left
+    // running, it could null _skipTarget out from under this new burst.
+    _skipPreviewTimer?.cancel();
+    _skipPreviewTimer = null;
     _skipCommitTimer?.cancel();
     _skipCommitTimer = Timer(const Duration(milliseconds: 320), () {
       _skipCommitTimer = null;
@@ -310,10 +314,7 @@ class _PlayerScreenState extends State<PlayerScreen>
       // Keep previewing the target until the player actually reports landing
       // there (see _onControllerTick) — clearing it the instant the seek is
       // issued made the bar snap back to the old spot for a frame or two.
-      _skipPreviewTimer?.cancel();
-      _skipPreviewTimer = Timer(const Duration(seconds: 5), () {
-        if (mounted) setState(() => _skipTarget = null);
-      });
+      _armSkipPreviewSafety();
     });
     _skipBadgeTimer?.cancel();
     _skipBadgeTimer = Timer(const Duration(milliseconds: 900), () {
@@ -323,6 +324,15 @@ class _PlayerScreenState extends State<PlayerScreen>
         _skipCount = 0;
         _skipAccum = Duration.zero;
       });
+    });
+  }
+
+  /// Safety net for a previewed seek target: if the player never reports
+  /// landing near it (see _onControllerTick), stop previewing after 5s.
+  void _armSkipPreviewSafety() {
+    _skipPreviewTimer?.cancel();
+    _skipPreviewTimer = Timer(const Duration(seconds: 5), () {
+      if (mounted) setState(() => _skipTarget = null);
     });
   }
 
@@ -539,13 +549,23 @@ class _PlayerScreenState extends State<PlayerScreen>
         resumeKey: widget.resumeKey,
         startAt: widget.startAt,
         durationHintSecs: widget.durationHint,
-        saveResume: (k, p, d) => _appState.saveResume(k, p, d),
+        saveResume: (k, p, d) =>
+            _appState.saveResume(k, p, d, sourceId: widget.source.id),
         externalVideo: _useNative,
       );
       unawaited(_autoLoadSavedSubtitle(widget.resumeKey));
     }
     _pc.addListener(_onControllerTick);
+    // PopScope.canPop is captured at build time and depends on where focus
+    // is (_inControlsNav) — rebuild when the root node gains/loses focus, or
+    // BACK could be swallowed for up to 4s after leaving the controls bar.
+    _focus.addListener(_onRootFocusChanged);
+    if (_isLive) _persistedPlayingIndex = widget.initialIndex;
     _scheduleHide();
+  }
+
+  void _onRootFocusChanged() {
+    if (mounted) setState(() {});
   }
 
   void _onControllerTick() {
@@ -560,6 +580,7 @@ class _PlayerScreenState extends State<PlayerScreen>
       _nativeReconnectAttempt = 0;
       _loadEpg();
     }
+    if (_isLive) _trackWatchedChannel();
     // A pending skip stops being a preview once the player has actually
     // landed near it — from here the seek bar follows the real position
     // again. (No setState needed: the same notification the AnimatedBuilder
@@ -595,6 +616,30 @@ class _PlayerScreenState extends State<PlayerScreen>
         _focus.requestFocus();
       }
     }
+  }
+
+  Timer? _watchedSettleTimer;
+  int _persistedPlayingIndex = -1;
+
+  /// "Fortsæt på sidste kanal" must remember the channel actually being
+  /// WATCHED, not the one the player was opened with — every in-player
+  /// change (CH±, digits, the surf drawer) used to leave the persisted id at
+  /// the channel from hours ago. Persisted 5s after the playing channel
+  /// settles, so zapping past a channel doesn't spam the recents list.
+  void _trackWatchedChannel() {
+    final idx = _pc.playingIndex;
+    if (idx < 0 || idx == _persistedPlayingIndex) return;
+    _watchedSettleTimer?.cancel();
+    _watchedSettleTimer = Timer(const Duration(seconds: 5), () {
+      if (!mounted || _pc.playingIndex != idx) return;
+      final ch = _pc.playingChannel;
+      if (ch == null) return;
+      _persistedPlayingIndex = idx;
+      // The category recorded when the player was opened is still the list
+      // this player is zapping through.
+      unawaited(_appState.markWatchedInCategory(
+          ch, _appState.lastLiveCategoryId));
+    });
   }
 
   Future<void> _loadEpg() async {
@@ -642,24 +687,87 @@ class _PlayerScreenState extends State<PlayerScreen>
     // (`rect.height * aspectRatio` instead of the possibly-stale `rect.width`
     // on Windows) while leaving [fit] as the one real, un-duplicated knob.
     final aspect = _pc.videoAspect;
-    return Video(
+    return _withAspectZoom(Video(
       controller: _pc.videoController,
       controls: NoVideoControls,
       fit: _pc.fit,
       aspectRatio: (isDesktop && aspect != null && aspect > 0) ? aspect : null,
+    ));
+  }
+
+  /// The zoom/wide half of [PlaybackController.aspectMode]: a centred scale
+  /// of the already contain-fitted frame, clipped to the viewport. Shared by
+  /// both backends so the button behaves identically on mpv and ExoPlayer.
+  /// ALWAYS present (identity scale for the plain modes) — toggling a wrapper
+  /// in and out would change the widget tree's shape and, on the native
+  /// path, recreate the platform view (the exact class of bug as bug-024).
+  Widget _withAspectZoom(Widget child) {
+    return ClipRect(
+      child: Transform.scale(
+        scaleX: _pc.aspectScaleX,
+        scaleY: _pc.aspectScaleY,
+        child: child,
+      ),
     );
   }
 
-  // ---------------- native ExoPlayer (live) ----------------
+  Timer? _aspectToastTimer;
+  bool _showAspectToast = false;
+
+  /// Cycle the picture format AND say which mode is now active. For 16:9
+  /// content on a 16:9 screen several modes look the same, so without the
+  /// label the button reads as broken (it was reported that way three times).
+  void _cycleAspect() {
+    _pc.cycleFit();
+    _aspectToastTimer?.cancel();
+    setState(() => _showAspectToast = true);
+    _aspectToastTimer = Timer(const Duration(milliseconds: 1600), () {
+      if (mounted) setState(() => _showAspectToast = false);
+    });
+  }
+
+  /// Desktop: moving the mouse reveals the controls (and restarts the
+  /// auto-hide), and the cursor hides together with them — the standard
+  /// fullscreen-player behaviour. Before, only a click showed the bar and
+  /// the cursor sat on the picture forever.
+  void _onMouseHover(PointerHoverEvent _) {
+    if (!_showControls) setState(() => _showControls = true);
+    // While the pointer rests ON the bar (see _hoverHold) the bar stays.
+    if (!_controlsHovered) _scheduleHide();
+  }
+
+  bool _controlsHovered = false;
+
+  /// Desktop: while the pointer rests on the controls bar itself, the 4s
+  /// auto-hide must not pull the bar out from under it. Identity on
+  /// touch/TV (isDesktop is fixed for the process, so the tree shape never
+  /// flips at runtime).
+  Widget _hoverHold(Widget child) {
+    if (!isDesktop) return child;
+    return MouseRegion(
+      onEnter: (_) {
+        _controlsHovered = true;
+        _hideTimer?.cancel();
+      },
+      onExit: (_) {
+        _controlsHovered = false;
+        _scheduleHide();
+      },
+      child: child,
+    );
+  }
+
+  // ---------------- native ExoPlayer (live + on-demand) ----------------
   Widget _nativeVideo() {
     final url = _nativeUrl;
     if (url == null) return const ColoredBox(color: Colors.black);
     final video = NativeVideo(
       url: url,
       userAgent: widget.source.userAgent ?? kDefaultUserAgent,
-      // Live has no "resume" concept; on-demand's is only meaningful on the
-      // FIRST open (see NativeVideo.startAt's own doc) — subsequent URL
-      // changes (next-episode, reconnect) are driven by setSource() directly.
+      // Live has no "resume" concept. On-demand: the offset for whatever URL
+      // is current — NativeVideo applies it on the initial open AND on every
+      // URL change (adjacent-movie resume), and PlaybackController resets it
+      // per item, so next-episode correctly sees null here.
       startAt: _isLive ? null : _pc.pendingStartAt,
       onCreated: _onNativeCreated,
     );
@@ -674,15 +782,37 @@ class _PlayerScreenState extends State<PlayerScreen>
     // entirely by doing the sizing on the FLUTTER side instead — the same
     // FittedBox+SizedBox approach already used for _mediaKitVideo() — using
     // the aspect ratio pushed from NativeVideoView.kt's onVideoSizeChanged.
-    final aspect = _nativeVideoAspect;
-    if (aspect == null || aspect <= 0) return video;
-    const base = 1000.0; // arbitrary reference size — FittedBox rescales it
-    return ClipRect(
-      child: FittedBox(
-        fit: _pc.fit,
-        child: SizedBox(width: base, height: base / aspect, child: video),
-      ),
-    );
+    //
+    // The wrapper chain below has the SAME shape whether or not the ratio is
+    // known yet. An earlier version returned the bare NativeVideo until
+    // onVideoSizeChanged arrived and only then wrapped it — but Flutter can't
+    // reconcile a widget that moves from being the RepaintBoundary's direct
+    // child to sitting three levels deeper, so it disposed the old element
+    // (platform view gone, ExoPlayer released) and inflated a fresh one that
+    // re-opened the stream from its creation params. Every native open thus
+    // restarted itself about a second after the first frame: a black flash,
+    // a second connection to the provider (fatal on single-connection
+    // accounts) and, on-demand, the seconds already played thrown away.
+    // Until the ratio is known the box simply matches the viewport, which is
+    // a no-op under every BoxFit.
+    return _withAspectZoom(LayoutBuilder(builder: (context, c) {
+      final aspect = _nativeVideoAspect;
+      final double w, h;
+      if (aspect != null && aspect > 0) {
+        const base = 1000.0; // arbitrary reference size — FittedBox rescales it
+        w = base;
+        h = base / aspect;
+      } else {
+        w = c.maxWidth.isFinite ? c.maxWidth : 1920;
+        h = c.maxHeight.isFinite ? c.maxHeight : 1080;
+      }
+      return ClipRect(
+        child: FittedBox(
+          fit: _pc.fit,
+          child: SizedBox(width: w, height: h, child: video),
+        ),
+      );
+    }));
   }
 
   /// Plain-text subtitle overlay for the native on-demand path — ExoPlayer
@@ -759,13 +889,27 @@ class _PlayerScreenState extends State<PlayerScreen>
       _pc.setExternalBuffering(s == 'buffering');
       // mpv's own playing-stream never fires for the native path — drive the
       // wakelock from ExoPlayer's own state instead (see setExternalPlaying).
-      _pc.setExternalPlaying(s == 'ready' || s == 'buffering');
+      // ExoPlayer stays READY across play/pause, so a paused movie must not
+      // re-arm the lock on the next state event (a seek while paused emits
+      // buffering→ready) — gate on the play/pause intent for on-demand.
+      _pc.setExternalPlaying(
+          (s == 'ready' || s == 'buffering') && (_isLive || _pc.isPlaying));
       if (s == 'ready') {
         _pc.setExternalError(false);
         _nativeReconnectAttempt = 0;
         _nativeReconnectTimer?.cancel();
       }
-      if (s == 'ended' && !_isLive) _pc.setExternalEnded();
+      if (s == 'ended') {
+        if (_isLive) {
+          // A live stream that ends cleanly (provider restarted it, socket
+          // rotated, single-connection kick) drains to STATE_ENDED — the mpv
+          // path treats that as a drop and reconnects; this one silently
+          // froze on the last frame with the wakelock released.
+          _scheduleNativeReconnect();
+        } else {
+          _pc.setExternalEnded();
+        }
+      }
     });
     _nativeErrSub?.cancel();
     _nativeErrSub = c.errorStream.listen(
@@ -784,22 +928,26 @@ class _PlayerScreenState extends State<PlayerScreen>
     _nativeCuesSub = c.cuesStream.listen((txt) {
       _nativeEmbeddedCue.value = txt;
     });
+    // Play/pause is wired for BOTH modes: live has no button for it, but the
+    // sleep timer pauses through this same handler (see
+    // PlaybackController.setSleepTimer) — it used to pause the idle mpv
+    // instance instead, i.e. do nothing at all on the native path.
+    _pc.externalPlayPauseHandler = (playing) {
+      if (playing) {
+        c.play();
+      } else {
+        c.pause();
+      }
+    };
     if (!_isLive) {
-      // Live has no seek bar / position display / play-pause button, so this
-      // plumbing is on-demand only.
+      // Live has no seek bar / position display, so this plumbing is
+      // on-demand only.
       _nativePosSub?.cancel();
       _nativePosSub = c.positionStream.listen((p) {
         _nativeClock.value = p.position;
         if (mounted) _pc.setExternalPosition(p.position, p.duration);
       });
       _pc.externalSeekHandler = (to) => c.seekTo(to);
-      _pc.externalPlayPauseHandler = (playing) {
-        if (playing) {
-          c.play();
-        } else {
-          c.pause();
-        }
-      };
     }
   }
 
@@ -827,9 +975,13 @@ class _PlayerScreenState extends State<PlayerScreen>
     _nativeReconnectAttempt++;
     _pc.setExternalBuffering(true);
     _nativeReconnectTimer?.cancel();
+    // Bound to the item that failed: if the user zaps (or auto-next moves on)
+    // before the 2s elapse, this must NOT re-issue setSource on the NEW item
+    // — that restarted the fresh channel ~2s in, right as it was buffering.
+    final scheduledFor = _nativeUrl;
     _nativeReconnectTimer = Timer(const Duration(seconds: 2), () {
       final u = _nativeUrl;
-      if (mounted && u != null) {
+      if (mounted && u != null && u == scheduledFor) {
         _nativeController?.setSource(
           u,
           userAgent: widget.source.userAgent ?? kDefaultUserAgent,
@@ -873,6 +1025,13 @@ class _PlayerScreenState extends State<PlayerScreen>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Desktop: a minimized or covered window is not "leaving the app" the
+    // way the home button is on a phone — every desktop player keeps going
+    // (VLC, a browser tab) — and Flutter reports minimize as `hidden`, which
+    // the branch below would treat as backgrounding and pause/reopen the
+    // stream on every alt-tab-and-minimize. Closing the window disposes the
+    // screen and stops playback regardless.
+    if (isDesktop) return;
     // Stop the sound when the user leaves the app (home button / app switch);
     // pick live streams back up on return. In picture-in-picture the video is
     // still visible, so playback must keep running.
@@ -903,6 +1062,7 @@ class _PlayerScreenState extends State<PlayerScreen>
             // _wasPlaying check (don't auto-resume a movie the user had
             // manually paused before backgrounding).
             _nativeController?.play();
+            _pc.setExternalPlaying(true); // re-arm the wakelock too
           }
         }
       }
@@ -923,6 +1083,8 @@ class _PlayerScreenState extends State<PlayerScreen>
     _skipBadgeTimer?.cancel();
     _skipPreviewTimer?.cancel();
     _tapArmTimer?.cancel();
+    _aspectToastTimer?.cancel();
+    _watchedSettleTimer?.cancel();
     _nativeReconnectTimer?.cancel();
     _nativeStateSub?.cancel();
     _nativeErrSub?.cancel();
@@ -935,6 +1097,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     _pc.externalSeekHandler = null;
     _pc.externalPlayPauseHandler = null;
     _pc.removeListener(_onControllerTick);
+    _focus.removeListener(_onRootFocusChanged);
     _focus.dispose();
     _retryFocus.dispose();
     _playNowFocus.dispose();
@@ -1010,7 +1173,8 @@ class _PlayerScreenState extends State<PlayerScreen>
       source: widget.source,
       resumeKey: key,
       durationHintSecs: next.durationSecs ?? 0,
-      saveResume: (k, p, d) => _appState.saveResume(k, p, d),
+      saveResume: (k, p, d) =>
+          _appState.saveResume(k, p, d, sourceId: widget.source.id),
       externalVideo: _useNative,
     );
     unawaited(_autoLoadSavedSubtitle(key));
@@ -1037,7 +1201,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     final target = direction > 0 ? _nextMovie : _prevMovie;
     if (target == null) return;
     final key = 'vod:${target.id}';
-    final resume = await _appState.resumeFor(key);
+    final resume = await _appState.resumeFor(key, sourceId: widget.source.id);
     if (!mounted) return;
     if (isTvMode) _focus.requestFocus();
     setState(() {
@@ -1056,7 +1220,8 @@ class _PlayerScreenState extends State<PlayerScreen>
       resumeKey: key,
       startAt: resume != null ? Duration(seconds: resume.positionSecs) : null,
       durationHintSecs: target.durationSecs ?? 0,
-      saveResume: (k, p, d) => _appState.saveResume(k, p, d),
+      saveResume: (k, p, d) =>
+          _appState.saveResume(k, p, d, sourceId: widget.source.id),
       externalVideo: _useNative,
     );
     unawaited(_autoLoadSavedSubtitle(key));
@@ -1171,7 +1336,14 @@ class _PlayerScreenState extends State<PlayerScreen>
   /// state) — used to give BACK a "close the menu first" step here too, the
   /// same one-off exception already made for the surf drawer.
   bool get _inControlsNav =>
-      isTvMode && _showControls && !_focus.hasPrimaryFocus && !_showSurf;
+      isTvMode &&
+      _showControls &&
+      !_showSurf &&
+      // Focus on the error/auto-next overlay's buttons is NOT the bar — BACK
+      // there must leave the player, not "close the menu".
+      !_pc.hasError &&
+      _nextCountdown == null &&
+      !_focus.hasPrimaryFocus;
 
   /// BACK while genuinely navigating the controls bar used to fall straight
   /// through to PopScope and exit the movie — closing what's really just an
@@ -1186,7 +1358,11 @@ class _PlayerScreenState extends State<PlayerScreen>
 
   void _toggleControls() {
     setState(() => _showControls = !_showControls);
-    if (_showControls) _scheduleHide();
+    if (_showControls) {
+      _scheduleHide();
+    } else {
+      _controlsHovered = false; // MouseRegion.onExit never fires on unmount
+    }
   }
 
   void _scheduleHide() {
@@ -1195,6 +1371,7 @@ class _PlayerScreenState extends State<PlayerScreen>
       // Only auto-hide in "quick mode" — never yank the bar out from under a
       // remote user who has focus inside the controls.
       if (mounted && !_showSurf && (!isTvMode || _focus.hasPrimaryFocus)) {
+        _controlsHovered = false;
         setState(() => _showControls = false);
       }
     });
@@ -1360,6 +1537,16 @@ class _PlayerScreenState extends State<PlayerScreen>
       }
     }
 
+    // Space = play/pause on movies/series — the universal keyboard
+    // expectation on a desktop, where it used to merely reveal the controls
+    // bar like OK does. Sits before the OK block so it wins there; TV
+    // navigate mode already returned above, so a focused button in the bar
+    // still gets its Space.
+    if (e is KeyDownEvent && k == LogicalKeyboardKey.space && !_isLive) {
+      _pc.playPause();
+      _revealControls();
+      return KeyEventResult.handled;
+    }
     if (e is KeyDownEvent &&
         (k == LogicalKeyboardKey.select ||
             k == LogicalKeyboardKey.enter ||
@@ -1371,6 +1558,10 @@ class _PlayerScreenState extends State<PlayerScreen>
         _retry();
         return KeyEventResult.handled;
       }
+      // Desktop/tablet keyboard: a control inside the bar reached with Tab
+      // must receive its own Enter (activation) — swallowing it here just
+      // re-revealed the bar and the focused button never fired.
+      if (!isTvMode && !_focus.hasPrimaryFocus) return KeyEventResult.ignored;
       // OK reveals the controls bar and moves focus into it, so tracks / sleep
       // timer / aspect / slider are reachable with the remote. (On touch this
       // path is unused — the GestureDetector toggles the bar directly.)
@@ -1428,10 +1619,22 @@ class _PlayerScreenState extends State<PlayerScreen>
         focusNode: _focus,
         autofocus: true,
         onKeyEvent: _onKey,
-        // The skip zones are a fraction of the player's WIDTH, so the tap
-        // handler needs the real box — MediaQuery would also include whatever
-        // the Scaffold trimmed off.
-        child: LayoutBuilder(builder: (context, constraints) {
+        child: MouseRegion(
+          // Desktop only (isDesktop is fixed for the process, so this never
+          // flips the tree shape at runtime): cursor hides with the controls,
+          // mouse movement brings both back — see _onMouseHover.
+          cursor: (isDesktop &&
+                  !_showControls &&
+                  !_showSurf &&
+                  !_pc.hasError &&
+                  _nextCountdown == null)
+              ? SystemMouseCursors.none
+              : MouseCursor.defer,
+          onHover: isDesktop ? _onMouseHover : null,
+          // The skip zones are a fraction of the player's WIDTH, so the tap
+          // handler needs the real box — MediaQuery would also include
+          // whatever the Scaffold trimmed off.
+          child: LayoutBuilder(builder: (context, constraints) {
           return GestureDetector(
           // onTapUp (not onTap) so the tap's x position is available: the
           // left/right thirds are double-tap skip zones on movies/series, the
@@ -1480,6 +1683,18 @@ class _PlayerScreenState extends State<PlayerScreen>
                           child: _toast('Genopretter forbindelse… (${_pc.reconnectAttempt}/5)'),
                         ),
                       ),
+                    if (_showAspectToast)
+                      Positioned(
+                        top: 40,
+                        left: 0,
+                        right: 0,
+                        child: IgnorePointer(
+                          child: Center(
+                            child: _toast(
+                                'Billedformat: ${_pc.aspectMode.label}'),
+                          ),
+                        ),
+                      ),
                     if (_pc.hasError) _errorOverlay(),
                     if (_numberBuffer.isNotEmpty)
                       Center(
@@ -1506,6 +1721,7 @@ class _PlayerScreenState extends State<PlayerScreen>
           ),
         );
         }),
+        ),
       ),
       ),
     );
@@ -1668,7 +1884,7 @@ class _PlayerScreenState extends State<PlayerScreen>
       child: SafeArea(
         child: Column(
           children: [
-            Row(
+            _hoverHold(Row(
               children: [
                 FocusRing(
                   shape: BoxShape.circle,
@@ -1716,7 +1932,7 @@ class _PlayerScreenState extends State<PlayerScreen>
                   child: IconButton(
                     focusNode: _aspectFocus,
                     tooltip: 'Billedformat',
-                    onPressed: _pc.cycleFit,
+                    onPressed: _cycleAspect,
                     icon: const Icon(Icons.aspect_ratio, color: Colors.white),
                   ),
                 ),
@@ -1748,9 +1964,9 @@ class _PlayerScreenState extends State<PlayerScreen>
                 ),
                 const SizedBox(width: 8),
               ],
-            ),
+            )),
             const Spacer(),
-            if (_isLive) _liveBottom() else _onDemandBottom(),
+            _hoverHold(_isLive ? _liveBottom() : _onDemandBottom()),
           ],
         ),
       ),
@@ -1803,6 +2019,11 @@ class _PlayerScreenState extends State<PlayerScreen>
                     // release — dragging fired a synchronous, FIFO-serialized
                     // native seek per pixel, freezing playback for a
                     // second-plus after every scrub.
+                    // Hold the bar for the whole scrub: the 4s auto-hide used
+                    // to fire mid-drag and unmount the Slider before
+                    // onChangeEnd — no seek was ever issued, and the stuck
+                    // _dragPosition pinned the bar/clock at the abandoned spot.
+                    onChangeStart: (_) => _hideTimer?.cancel(),
                     onChanged: (v) {
                       // The scrub is now the user's intent — drop any skip
                       // burst still waiting to commit (see _cancelPendingSkip).
@@ -1811,8 +2032,19 @@ class _PlayerScreenState extends State<PlayerScreen>
                           () => _dragPosition = Duration(milliseconds: v.toInt()));
                     },
                     onChangeEnd: (v) {
-                      _pc.seek(Duration(milliseconds: v.toInt()));
-                      setState(() => _dragPosition = null);
+                      // Preview the target until the player lands there (same
+                      // mechanism as a skip burst): the bar no longer snaps
+                      // back to the stale pre-scrub position on release, and
+                      // a skip tapped right after chains off the scrub target
+                      // instead of seeking BACKWARDS from the old position.
+                      final t = _pc.clampSeek(Duration(milliseconds: v.toInt()));
+                      _pc.seek(t);
+                      setState(() {
+                        _dragPosition = null;
+                        _skipTarget = t;
+                      });
+                      _armSkipPreviewSafety();
+                      _scheduleHide();
                     },
                   ),
                 ),
@@ -2035,7 +2267,8 @@ class _PlayerScreenState extends State<PlayerScreen>
                         // subtitles off here would still come back next time
                         // this item is reopened (see _autoLoadSavedSubtitle).
                         if (_resumeKey != null) {
-                          unawaited(_appState.clearSubtitleChoice(_resumeKey!));
+                          unawaited(_appState.clearSubtitleChoice(_resumeKey!,
+                              sourceId: widget.source.id));
                         }
                         Navigator.pop(sheetContext);
                       },
@@ -2060,7 +2293,7 @@ class _PlayerScreenState extends State<PlayerScreen>
                             setState(() => _nativeSubtitleCues = null);
                             _pc.setExternalSubtitleTitle(null);
                             if (_resumeKey != null) {
-                              unawaited(_appState.saveSubtitleChoice(
+                              unawaited(_saveSubtitleChoice(
                                 _resumeKey!,
                                 SubtitleChoice(
                                   '',
@@ -2090,7 +2323,7 @@ class _PlayerScreenState extends State<PlayerScreen>
                             _pc.player.setSubtitleTrack(s);
                             _pc.setExternalSubtitleTitle(null);
                             if (_resumeKey != null) {
-                              unawaited(_appState.saveSubtitleChoice(
+                              unawaited(_saveSubtitleChoice(
                                 _resumeKey!,
                                 SubtitleChoice(
                                   '',
@@ -2280,7 +2513,8 @@ class _PlayerScreenState extends State<PlayerScreen>
     // a painstakingly synced subtitle is still synced on the next open.
     if (_resumeKey != null) {
       unawaited(_appState.saveSubtitleTiming(
-          _resumeKey!, _pc.subDelaySecs, _pc.subSpeed));
+          _resumeKey!, _pc.subDelaySecs, _pc.subSpeed,
+          sourceId: widget.source.id));
     }
   }
 
@@ -2319,7 +2553,8 @@ class _PlayerScreenState extends State<PlayerScreen>
       setState(() => _nativeSubtitleCues = null);
     }
     if (key == null) return;
-    final choice = await _appState.subtitleChoiceFor(key);
+    final choice =
+        await _appState.subtitleChoiceFor(key, sourceId: widget.source.id);
     if (choice == null) return;
     bool stale() =>
         !mounted || epoch != _subtitleEpoch || _userPickedSubtitle;
@@ -2538,7 +2773,7 @@ class _PlayerScreenState extends State<PlayerScreen>
       // "Fortsæt" — silently reloads this same choice instead of requiring
       // the whole search+pick flow again. See _autoLoadSavedSubtitle.
       if (_resumeKey != null) {
-        unawaited(_appState.saveSubtitleChoice(
+        unawaited(_saveSubtitleChoice(
             _resumeKey!, SubtitleChoice(picked.url, pickedLabel)));
       }
       if (mounted) _snack('Undertekster indlæst ($pickedLabel).');
@@ -2552,6 +2787,14 @@ class _PlayerScreenState extends State<PlayerScreen>
   void _snack(String msg) {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
   }
+
+  /// Every persisted resume/subtitle call from this screen is namespaced by
+  /// the source the item was opened FROM (`widget.source`), never by whatever
+  /// source happens to be active — they're the same thing for streamed
+  /// content, but a downloaded episode from source B played while A is
+  /// active used to read and write its progress under A.
+  Future<void> _saveSubtitleChoice(String key, SubtitleChoice choice) =>
+      _appState.saveSubtitleChoice(key, choice, sourceId: widget.source.id);
 
   Future<void> _showSleep() => _withIdleSuspended(_showSleepBody);
 

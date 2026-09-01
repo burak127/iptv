@@ -65,7 +65,11 @@ class _MovieDetailScreenState extends State<MovieDetailScreen> {
     });
   }
 
-  void _play({bool fromStart = false}) {
+  /// [fromStart] is ONLY the explicit "Start forfra" press. The resume point
+  /// is resolved fresh every time: the value cached at page-open is stale
+  /// the moment the player has run — after watching 40 minutes and pressing
+  /// Back, "Afspil" restarted the film from 0:00.
+  Future<void> _play({bool fromStart = false}) async {
     final state = context.read<AppState>();
     final source = state.active;
     if (source == null) return;
@@ -75,13 +79,14 @@ class _MovieDetailScreenState extends State<MovieDetailScreen> {
         .read<DownloadManager>()
         .playableLocalPath(_resumeKey, sourceId: source.id);
     final url = local ?? StreamUrlBuilder.movie(source, _movie);
-    final startAt = (!fromStart && _resume != null)
-        ? Duration(seconds: _resume!.positionSecs)
-        : null;
+    final resume = fromStart ? null : await state.resumeFor(_resumeKey);
+    if (!mounted) return;
+    final startAt =
+        resume != null ? Duration(seconds: resume.positionSecs) : null;
     final siblings = widget.siblingMovies;
     final siblingIndex =
         siblings?.indexWhere((m) => m.id == _movie.id) ?? -1;
-    Navigator.of(context).push(
+    await Navigator.of(context).push(
       MaterialPageRoute(
         builder: (_) => PlayerScreen.onDemand(
           source: source,
@@ -98,6 +103,10 @@ class _MovieDetailScreenState extends State<MovieDetailScreen> {
         ),
       ),
     );
+    // Back from the player: refresh so the button reads "Fortsæt (…)" now.
+    if (!mounted) return;
+    final updated = await state.resumeFor(_resumeKey);
+    if (mounted) setState(() => _resume = updated);
   }
 
   @override
@@ -223,7 +232,7 @@ class _MovieDetailScreenState extends State<MovieDetailScreen> {
       children: [
         FilledButton.icon(
           autofocus: true,
-          onPressed: () => _play(fromStart: resume == null),
+          onPressed: () => _play(),
           icon: const Icon(Icons.play_arrow),
           label: Text(
             resume != null

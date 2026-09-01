@@ -115,6 +115,17 @@ class DownloadIo {
           await cleanup(); // keep the partial file for a later resume
           return;
         }
+        if (resp.statusCode == 416 && resuming) {
+          // Range Not Satisfiable while resuming = the partial file already
+          // holds every byte (the app was killed right at the end, before
+          // the item was marked complete). Treating it as an error deleted a
+          // finished multi-GB file and started over from byte 0.
+          finished = true;
+          client.close();
+          onProgress(resumeFrom, resumeFrom);
+          onDone();
+          return;
+        }
         if (resp.statusCode < 200 || resp.statusCode >= 300) {
           await fail('HTTP ${resp.statusCode}');
           return;

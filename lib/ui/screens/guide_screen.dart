@@ -29,35 +29,56 @@ class _GuideScreenState extends State<GuideScreen> {
   String? _error;
   LiveChannel? _selected;
   int _dayOffset = 0; // -2..+1, 0 = today
+  // The IndexedStack keeps this tab alive across a source switch: the guide
+  // (and the selected channel, whose "Se live" URL is built for ITS source)
+  // must be tied to the source it was loaded for, and a load that finishes
+  // after a switch must be discarded — hence the id + generation below.
+  String? _loadedSourceId;
+  int _loadGen = 0;
 
-  @override
-  void initState() {
-    super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _load());
-  }
+  // No initState load: the first build sees _loadedSourceId == null !=
+  // active.id and goes through _resetForSourceSwitch, which schedules it —
+  // one load, not two racing ones.
 
   Future<void> _load({bool force = false}) async {
     final state = context.read<AppState>();
     final s = state.active;
-    if (s == null || !s.isXtream || _loading) return;
+    _loadedSourceId = s?.id;
+    if (s == null || !s.isXtream) return;
+    final gen = ++_loadGen;
     setState(() {
       _loading = true;
       _error = null;
     });
     try {
       final g = await state.repository.loadGuide(s, forceRefresh: force);
-      if (!mounted) return;
+      if (!mounted || gen != _loadGen) return;
       setState(() {
         _guide = g;
         _loading = false;
       });
     } catch (e) {
-      if (!mounted) return;
+      if (!mounted || gen != _loadGen) return;
       setState(() {
         _error = IptvErrors.map(e).message;
         _loading = false;
       });
     }
+  }
+
+  /// Source changed under a live tab: drop everything that belonged to the
+  /// old provider and reload. Runs from build; _load sets _loadedSourceId
+  /// synchronously, so this fires once per switch.
+  void _resetForSourceSwitch() {
+    _guide = null;
+    _selected = null;
+    _dayOffset = 0;
+    _epgChannelIds = null;
+    _error = null;
+    _loading = false;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _load();
+    });
   }
 
   List<GuideEntry> _entriesFor(LiveChannel ch) {
@@ -95,6 +116,7 @@ class _GuideScreenState extends State<GuideScreen> {
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
+    if (state.active?.id != _loadedSourceId) _resetForSourceSwitch();
     return Scaffold(
       appBar: AppBar(
         title: const Text('Guide'),

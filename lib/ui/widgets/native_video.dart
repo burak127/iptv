@@ -155,13 +155,21 @@ class NativeVideoController {
     }
   }
 
-  Future<void> setSource(String url, {String? userAgent, Duration? startAt}) =>
-      _channel.invokeMethod('setSource', {
-        'url': url,
-        if (userAgent != null) 'userAgent': userAgent,
-        if (startAt != null && startAt > Duration.zero)
-          'startPositionMs': startAt.inMilliseconds,
-      }).catchError((_) {});
+  Future<void> setSource(String url, {String? userAgent, Duration? startAt}) {
+    // The old item's track lists are stale the moment a new source is set —
+    // a saved-subtitle restore that polled [tracks] right after next-episode
+    // resolved the PREVIOUS episode's group/track indexes and selected a
+    // wrong (or no) track on the new one. Cleared here; ExoPlayer re-pushes
+    // the real lists via onTracksChanged once the new item is prepared.
+    tracks = const NativeTracks();
+    if (!_tracks.isClosed) _tracks.add(tracks);
+    return _channel.invokeMethod('setSource', {
+      'url': url,
+      if (userAgent != null) 'userAgent': userAgent,
+      if (startAt != null && startAt > Duration.zero)
+        'startPositionMs': startAt.inMilliseconds,
+    }).catchError((_) {});
+  }
   Future<void> seekTo(Duration position) => _channel
       .invokeMethod('seekTo', {'position': position.inMilliseconds}).catchError((_) {});
   Future<void> play() => _channel.invokeMethod('play').catchError((_) {});

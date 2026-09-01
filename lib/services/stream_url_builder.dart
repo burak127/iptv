@@ -3,12 +3,20 @@ import '../models/live_channel.dart';
 import '../models/movie.dart';
 import '../models/series.dart';
 
+/// Ensure an http(s) scheme, case-insensitively. Phone keyboards
+/// auto-capitalise the first letter ("Http://…"), and a case-sensitive check
+/// then produced "http://Http://…" — a host no one could connect to.
+String normalizeUrlScheme(String url) {
+  final v = url.trim();
+  final lower = v.toLowerCase();
+  if (lower.startsWith('http://')) return 'http://${v.substring(7)}';
+  if (lower.startsWith('https://')) return 'https://${v.substring(8)}';
+  return 'http://$v';
+}
+
 /// Normalize a host to `http(s)://host[:port]` with no trailing slash.
 String normalizeHost(String host) {
-  var v = host.trim();
-  if (!v.startsWith('http://') && !v.startsWith('https://')) {
-    v = 'http://$v';
-  }
+  var v = normalizeUrlScheme(host);
   while (v.endsWith('/')) {
     v = v.substring(0, v.length - 1);
   }
