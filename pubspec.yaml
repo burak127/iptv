@@ -1,7 +1,7 @@
 name: iptv_player
 description: "Cross-platform IPTV player for Android, Android TV and Web (M3U + Xtream Codes)."
 publish_to: 'none'
-version: 1.2.0+3
+version: 1.3.0+4
 
 environment:
   # Flutter 3.27+ (Dart 3.6+) — required for Color.withValues(...).

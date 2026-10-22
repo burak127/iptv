@@ -362,7 +362,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           const _SectionHeader('Om'),
           const ListTile(
             leading: Icon(Icons.info_outline),
-            title: Text('IPTV Player · v1.2'),
+            title: Text('IPTV Player · v1.3'),
           ),
         ],
       ),

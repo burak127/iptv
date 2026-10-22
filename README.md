@@ -1,71 +1,101 @@
 # IPTV Player
 
-En cross-platform IPTV-afspiller bygget i **Flutter** — én kodebase til:
+En cross-platform IPTV-afspiller bygget i **Flutter**. Én kodebase til:
 
 - 📱 **Android** (telefon/tablet)
-- 📺 **Android TV** (fjernbetjening / D-pad)
-- 🌐 **Web**
+- 📺 **Android TV / Google TV** (fjernbetjening/D-pad, kan starte automatisk som kiosk)
+- 🍏 **iPhone/iPad** (sideload med gratis Apple-ID)
+- 🪟 **Windows**
+- 🌐 **Web** (delvist)
 
-**V1-funktioner:** Live TV med kategorier og kanalliste. Understøtter både
-**M3U/M3U8-playlists** og **Xtream Codes-login**.
+Understøtter **M3U/M3U8-playlister** og **Xtream Codes-login**.
 
-> ⚖️ Appen indeholder **intet** indhold. Den afspiller kun de playlists/konti,
+> ⚖️ Appen indeholder **intet** indhold. Den afspiller kun de playlister/konti,
 > *du selv* indtaster og har ret til at bruge (fx dit eget IPTV-abonnement).
+
+## Funktioner
+
+- Live-tv med kategorier, tv-guide (EPG) og op til **12 timers spoling tilbage** på kanaler med arkiv (Xtream catch-up)
+- Film og serier (Xtream) med "fortsæt hvor du slap" og automatisk næste afsnit
+- Søgning, favoritter, senest sete samt skjul/sortér kategorier
+- Undertekster: indbyggede spor + søgning efter eksterne undertekster
+- Dobbelt-tap i venstre/højre side spoler (Netflix-agtigt), sleep-timer og billedformater
+- Forældre-PIN, downloads og flere kilder, som kan redigeres
+- Tilføj en kilde fra telefonen ved at scanne en QR-kode på tv'et
 
 ---
 
-## 1. Krav (installeres én gang)
+## Download
 
-1. **Flutter SDK** — https://docs.flutter.dev/get-started/install/windows
-   Udpak fx til `C:\src\flutter` og tilføj `C:\src\flutter\bin` til PATH.
-2. **Android Studio** (til Android SDK + emulator/TV-emulator).
-   Kør `flutter doctor` og følg anvisningerne, til alt er grønt.
+Færdige filer ligger under [**Releases**](https://github.com/burak127/iptv/releases):
 
-Bekræft med:
+| Platform | Fil | Sådan |
+|---|---|---|
+| Android / Android TV | `.apk` | Åbn filen på enheden (tillad "ukendte apps") eller `adb install` |
+| Windows | `-windows-x64.zip` | Pak **hele** mappen ud og kør `iptv_player.exe` |
+| iPhone/iPad | `-ios.ipa` | Se næste afsnit |
+
+## Installér på iPhone
+
+Apple tillader ikke apps udenom App Store, men med et **gratis Apple-ID** kan du selv
+signere og installere `.ipa`-filen:
+
+**AltStore (testet, fornyer automatisk)**
+1. Installér AltServer på din pc fra [altstore.io](https://altstore.io) (på Windows kræves iTunes og iCloud fra Apples hjemmeside, ikke Microsoft Store), og brug den til at installere AltStore på iPhonen.
+2. Hent `iptv-player-…-ios.ipa` fra Releases på iPhonen.
+3. Åbn AltStore ▸ **My Apps** ▸ **+** ▸ vælg filen og log ind med dit Apple-ID.
+4. På iPhonen: slå **Udviklertilstand** til (Indstillinger ▸ Anonymitet og sikkerhed) og stol på dit Apple-ID under Indstillinger ▸ Generelt ▸ VPN og enhedsadministration.
+
+**Sideloadly** ([sideloadly.io](https://sideloadly.io)) bør også virke: tilslut iPhonen med kabel, træk `.ipa`-filen ind og tryk Start.
+
+> Med et gratis Apple-ID udløber appen efter **7 dage**. AltStore fornyer den automatisk,
+> når iPhonen og pc'en med AltServer er på samme wifi.
+
+---
+
+## Byg og redigér selv
+
+**Krav:** [Flutter](https://docs.flutter.dev/get-started/install) 3.44.4 (stable). Tjek med `flutter doctor`.
 
 ```powershell
-flutter --version
-flutter doctor
+flutter pub get
+flutter run                 # vælg telefon/emulator/TV
+flutter run -d windows      # Windows-app
+flutter run -d chrome       # webapp
 ```
 
-## 2. Opsætning af projektet
+**Release-builds**
 
-Fra denne mappe (`iptv_player`):
+- **Android:** `flutter build apk --release` → `build/app/outputs/flutter-apk/app-release.apk`.
+  Repoet har ingen release-nøgle, så APK'en signeres med din egen debug-nøgle. En app, der er installeret
+  fra en anden pc's build, skal derfor afinstalleres før opdatering.
+- **Windows:** `flutter build windows --release` → hele mappen `build/windows/x64/runner/Release/`.
+- **iPhone uden Mac:** fork repoet ▸ fanen **Actions** ▸ **iOS IPA (sideload)** ▸ **Run workflow**.
+  Efter 10-20 minutter ligger `.ipa`-filen under run'ets *Artifacts*. GitHub stiller Mac'en gratis til rådighed for offentlige repoer.
+- **iPhone med Mac:** `flutter pub get` og derefter `bash tool/build_ios_ipa.sh`.
+
+Byggescriptet gen-signerer alle frameworks og stopper buildet, hvis AltStore ville afvise en fil
+(forklaringen står i toppen af `tool/build_ios_ipa.sh`).
+
+**Ny udgivelse:** et annoteret tag bygger automatisk `.ipa`-filen og lægger den på releasen.
+Tagbeskeden bliver releasens titel og tekst:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\setup.ps1
+git tag -a v1.4.0 -m "v1.4.0 — kort titel" -m "Hvad er nyt…"
+git push origin v1.4.0
 ```
 
-Scriptet gør følgende automatisk:
-1. Sikkerhedskopierer `lib/` + `pubspec.yaml`.
-2. Kører `flutter create .` som genererer `android/` og `web/`.
-3. Gendanner app-koden ovenpå Flutters skabelon.
-4. Indsætter Android TV-manifestet (`platform_templates/AndroidManifest.xml`).
-5. Kører `flutter pub get`.
-
-> Vil du gøre det manuelt, er trinnene præcis de samme — se `setup.ps1`.
-
-## 3. Kør appen
-
-```powershell
-flutter devices           # vis tilgængelige enheder
-flutter run               # telefon / emulator / TV (vælg enhed)
-flutter run -d chrome     # webapp i browseren
-```
+**Tests:** `flutter test` og `flutter analyze`.
 
 ### Android TV
-- **Emulator:** opret en *Television*-enhed i Android Studio ▸ Device Manager, start den, og kør `flutter run`.
-- **Fysisk TV-boks:** slå *Udvikler-tilstand* + *USB/netværks-fejlretning* til på boksen, forbind med `adb connect <tv-ip>:5555`, og kør `flutter run`.
-- **Byg APK til sideload:** `flutter build apk --release` → filen ligger i `build/app/outputs/flutter-apk/app-release.apk`.
+- **Emulator:** opret en *Television*-enhed i Android Studio ▸ Device Manager og kør `flutter run`.
+- **Fysisk boks:** slå *Udviklertilstand* og *netværks-fejlretning* til på boksen, forbind med
+  `adb connect <boksens-ip>:5555` og kør `flutter run` eller `adb install -r app-release.apk`.
 
-## 4. Test med en gratis, lovlig playlist
+### Test med en gratis, lovlig playlist
 
-Har du ikke et abonnement ved hånden, kan du teste med iptv-org's frit tilgængelige liste:
-
-- Vælg **M3U-playlist** i appen
-- URL: `https://iptv-org.github.io/iptv/index.m3u`
-
-(Stor liste — vælg en kategori for hurtigere overblik.)
+Vælg **M3U-playlist** i appen og brug `https://iptv-org.github.io/iptv/index.m3u`
+(stor liste, så vælg en kategori for hurtigere overblik).
 
 ---
 
@@ -73,46 +103,23 @@ Har du ikke et abonnement ved hånden, kan du teste med iptv-org's frit tilgæng
 
 ```
 lib/
-├── main.dart                 App-indgang + MediaKit-init
-├── app.dart                  MaterialApp + start-routing (onboarding vs. home)
-├── theme.dart                Mørkt, TV-venligt tema
-├── models/
-│   ├── iptv_source.dart      M3U- eller Xtream-konfiguration (+ JSON)
-│   ├── category.dart         Kanalkategori
-│   └── channel.dart          Enkelt kanal
-├── services/
-│   ├── m3u_parser.dart       Parser #EXTINF/group-title → kanaler
-│   ├── xtream_client.dart    player_api.php: kategorier + live-streams
-│   ├── source_repository.dart  Gemmer kilder (shared_preferences)
-│   └── iptv_repository.dart  Fælles indlæsning uanset kildetype
-├── state/
-│   └── app_state.dart        Provider/ChangeNotifier — sources, data, valg
-└── ui/
-    ├── screens/
-    │   ├── add_source_screen.dart   Tilføj M3U/Xtream
-    │   ├── sources_screen.dart      Skift/slet kilder
-    │   ├── home_screen.dart         Kategorier + kanal-grid (responsivt)
-    │   └── player_screen.dart       Fuldskærm media_kit-afspiller
-    └── widgets/
-        ├── focusable_card.dart      D-pad-fokus-highlight (TV)
-        └── channel_card.dart        Kanal-felt i grid
+├── main.dart, app.dart   Opstart, tema og routing (første kilde vs. hjem)
+├── models/               Kilder, kanaler, film, serier, EPG
+├── services/             M3U-, Xtream- og XMLTV-klienter, cache, stream-URL'er,
+│                         undertekster, arkivspoling og platformtjenester
+├── state/                AppState (kilder, kataloger, favoritter, resume)
+│                         og PlaybackController (afspilleren)
+└── ui/                   Skærme (live, film, serier, guide, søg, afspiller …)
+                          og widgets (TV-fokus, eget skærmtastatur)
+android/   Native ExoPlayer-afspiller til svage TV-bokse, PiP og autostart
+ios/       Xcode-projektet (Info.plist tillader http-streams)
+windows/   Desktop-runner
+tool/      iOS-byggescript og AltStore-kontrol
 ```
 
-**Afspiller:** [`media_kit`](https://pub.dev/packages/media_kit) (libmpv) — håndterer
-HLS/live/TS og mærkelige codecs langt bedre end Flutters standard-player.
+**Afspiller:** [`media_kit`](https://pub.dev/packages/media_kit) (libmpv) på alle platforme. Den håndterer
+HLS/live/TS og mærkelige codecs langt bedre end Flutters standardafspiller. På Android TV kan
+man i indstillingerne skifte til den native ExoPlayer-afspiller, der kører glattere på svage bokse.
 
-**TV-navigation:** `FocusableActionDetector` giver hvert felt et tydeligt
-fokus-highlight og reagerer på OK/Enter/Select. I afspilleren skifter
-pil-op/ned (eller Channel Up/Down) kanal.
-
-**Web-note:** På web afspilles streams via browserens muligheder. Ren HLS-live
-virker natively i Safari; i Chrome kan visse HLS-streams kræve en senere
-`hls.js`-integration. Android er den primære, mest robuste platform.
-
-## Roadmap (næste versioner)
-
-- [ ] EPG / programguide (nu & næste)
-- [ ] VOD & serier (Xtream)
-- [ ] Favoritter + søgning + "senest set"
-- [ ] Forældrekontrol / PIN
-- [ ] hls.js-fallback for fuld HLS på web
+**TV-navigation:** alle felter har et tydeligt fokus-highlight og reagerer på OK/Enter. I afspilleren
+skifter pil-op/ned (eller Channel Up/Down) kanal.
