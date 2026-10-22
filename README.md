@@ -71,7 +71,7 @@ flutter run -d chrome       # webapp
   fra en anden pc's build, skal derfor afinstalleres før opdatering.
 - **Windows:** `flutter build windows --release` → hele mappen `build/windows/x64/runner/Release/`.
 - **iPhone uden Mac:** fork repoet ▸ fanen **Actions** ▸ **iOS IPA (sideload)** ▸ **Run workflow**.
-  Efter 10-20 minutter ligger `.ipa`-filen under run'ets *Artifacts*. GitHub stiller Mac'en gratis til rådighed for offentlige repoer.
+  Efter ca. 5 minutter ligger `.ipa`-filen under run'ets *Artifacts*. GitHub stiller Mac'en gratis til rådighed for offentlige repoer.
 - **iPhone med Mac:** `flutter pub get` og derefter `bash tool/build_ios_ipa.sh`.
 
 Byggescriptet gen-signerer alle frameworks og stopper buildet, hvis AltStore ville afvise en fil
@@ -123,3 +123,8 @@ man i indstillingerne skifte til den native ExoPlayer-afspiller, der kører glat
 
 **TV-navigation:** alle felter har et tydeligt fokus-highlight og reagerer på OK/Enter. I afspilleren
 skifter pil-op/ned (eller Channel Up/Down) kanal.
+
+## Licens
+
+[MIT](LICENSE): du må frit bruge, ændre og dele koden, også i dine egne projekter, så længe
+copyright-linjen følger med.
