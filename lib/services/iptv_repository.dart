@@ -256,6 +256,9 @@ class IptvRepository {
   Future<List<EpgEntry>> shortEpg(IptvSource s, String streamId) =>
       _xtream(s).getShortEpg(streamId);
 
+  Future<Duration?> archiveClockOffset(IptvSource s) =>
+      _xtream(s).getArchiveClockOffset();
+
   Future<void> clearCache() => _cache.clear();
 
   /// Delete all cached catalogs for a removed source.

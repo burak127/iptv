@@ -7,6 +7,7 @@ import '../models/live_channel.dart';
 import '../models/movie.dart';
 import '../models/series.dart';
 import 'epg_time.dart';
+import 'archive_window.dart';
 import 'http_client.dart';
 import 'json_util.dart';
 import 'stream_url_builder.dart';
@@ -42,6 +43,16 @@ class XtreamClient {
         'password': source.password ?? '',
         ...params,
       });
+
+  Future<Duration?> getArchiveClockOffset() async {
+    final data = await http.getJson(_api(const {}), userAgent: _ua);
+    final info = data is Map ? data['server_info'] : null;
+    if (info is! Map) return null;
+    return archiveServerClockOffset(
+      asStringOrNull(info['time_now']),
+      asIntOrNull(info['timestamp_now']),
+    );
+  }
 
   Future<XtreamUserInfo> authenticate() async {
     final data = await http.getJson(_api(const {}), userAgent: _ua);
@@ -226,9 +237,10 @@ class XtreamClient {
     return asList(listings)
         .whereType<Map>()
         .map((m) {
+          final startTimestamp = asIntOrNull(m['start_timestamp']);
           final start = EpgTime.fromXtream(
               isoish: asStringOrNull(m['start']),
-              unixTimestamp: asIntOrNull(m['start_timestamp']));
+              unixTimestamp: startTimestamp);
           final end = EpgTime.fromXtream(
               isoish: asStringOrNull(m['end']),
               unixTimestamp: asIntOrNull(m['stop_timestamp']));
@@ -238,6 +250,9 @@ class XtreamClient {
             description: decodeEpgText(asStringOrNull(m['description'])),
             startUtc: start,
             endUtc: end,
+            serverStart: startTimestamp != null && startTimestamp > 0
+                ? asStringOrNull(m['start'])
+                : null,
           );
         })
         .whereType<EpgEntry>()

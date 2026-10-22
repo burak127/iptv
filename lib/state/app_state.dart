@@ -205,15 +205,69 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  /// True when two records of the same source id point at a different
+  /// provider/account — i.e. everything cached under that id is now stale.
+  /// A rename, a User-Agent tweak or a stream-format change is NOT that.
+  static bool _connectionChanged(IptvSource a, IptvSource b) =>
+      a.type != b.type ||
+      a.m3uUrl != b.m3uUrl ||
+      a.host != b.host ||
+      a.username != b.username ||
+      a.password != b.password;
+
   Future<void> updateSource(IptvSource source) async {
+    final previous = _firstWhereOrNull(sources, (s) => s.id == source.id);
     sources = [for (final s in sources) if (s.id == source.id) source else s];
     await _sourceRepo.saveSources(sources);
+    // Editing the host/login/playlist URL points the SAME source id at
+    // another account, so every catalog cached under it belongs to the old
+    // one. Live is force-reloaded below, but without this the Film/Serier
+    // tabs kept listing the PREVIOUS provider's titles indefinitely:
+    // vodLoaded/seriesLoaded suppress a refetch in memory, and the on-disk
+    // cache would serve the old account for another 12h after a restart.
+    final reconnected = previous != null && _connectionChanged(previous, source);
+    if (reconnected) await _repo.purgeSource(source.id);
     if (active?.id == source.id) {
       active = source;
+      if (reconnected) {
+        _resetVodSeries();
+        accountExpiry = null;
+      }
       await loadLive(forceRefresh: true);
+      if (reconnected && source.isXtream) {
+        // Expiry banner belongs to the new account now.
+        accountInfo().then((info) {
+          if (info != null && active?.id == source.id) {
+            accountExpiry = info.expiry;
+            notifyListeners();
+          }
+        });
+      }
     } else {
       notifyListeners();
     }
+  }
+
+  /// Drop the in-memory VOD/series slices and their "already loaded" flags so
+  /// the next ensureVod/ensureSeries genuinely refetches, cancelling any
+  /// in-flight load whose result belongs to the previous account.
+  void _resetVodSeries() {
+    _vodGen++;
+    _seriesGen++;
+    vodCategories = [];
+    movies = [];
+    _vodByCat = {};
+    vodCategoryId = null;
+    vodLoaded = false;
+    vodLoading = false;
+    vodError = null;
+    seriesCategories = [];
+    series = [];
+    _seriesByCat = {};
+    seriesCategoryId = null;
+    seriesLoaded = false;
+    seriesLoading = false;
+    seriesError = null;
   }
 
   Future<void> removeSource(IptvSource source) async {

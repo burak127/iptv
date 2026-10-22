@@ -102,18 +102,32 @@ class _SourceTile extends StatelessWidget {
                 materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
               ),
             IconButton(
+              tooltip: 'Rediger kilde',
+              icon: const Icon(Icons.edit_outlined),
+              onPressed: () => _edit(context),
+            ),
+            IconButton(
               tooltip: 'Slet kilde',
               icon: const Icon(Icons.delete_outline),
               onPressed: () => _confirmDelete(context),
             ),
           ],
         ),
-        // Keep the active row focusable on TV (a null onTap would make the
-        // Delete icon its only focus stop).
-        onTap: isActive ? () {} : () => state.setActive(source),
+        // Tapping the ACTIVE row opens the editor — activating it again is a
+        // no-op, and the row still has to stay focusable on TV (a null onTap
+        // would make the icon buttons its only focus stops).
+        onTap: isActive ? () => _edit(context) : () => state.setActive(source),
       ),
       ),
     );
+  }
+
+  /// Open the source in the add-source form, pre-filled and unmasked, saving
+  /// back onto the same id (see [AddSourceScreen.existing]).
+  void _edit(BuildContext context) {
+    Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => AddSourceScreen(existing: source),
+    ));
   }
 
   /// M3U → the playlist URL. Xtream → "host · username".

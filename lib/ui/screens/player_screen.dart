@@ -13,6 +13,7 @@ import '../../models/media_item.dart' show MediaKind;
 import '../../models/movie.dart';
 import '../../models/series.dart';
 import '../../services/download_manager.dart';
+import '../../services/archive_window.dart';
 import '../../services/http_client.dart';
 import '../../services/pip_service.dart';
 import '../../services/progress_repository.dart' show SubtitleChoice;
@@ -65,7 +66,10 @@ class PlayerScreen extends StatefulWidget {
         movies = null,
         movieIndex = null,
         favoriteKind = null,
-        favoriteId = null;
+        favoriteId = null,
+        archivePlaylist = null,
+        archiveIndex = null,
+        archiveWindowStartUtc = null;
 
   const PlayerScreen.onDemand({
     super.key,
@@ -84,6 +88,9 @@ class PlayerScreen extends StatefulWidget {
     this.movieIndex,
     this.favoriteKind,
     this.favoriteId,
+    this.archivePlaylist,
+    this.archiveIndex,
+    this.archiveWindowStartUtc,
   })  : mode = PlaybackMode.onDemand,
         playlist = const [],
         initialIndex = 0;
@@ -121,6 +128,11 @@ class PlayerScreen extends StatefulWidget {
   /// channel instead (see [_favId]).
   final MediaKind? favoriteKind;
   final String? favoriteId;
+
+  /// Set only for a 12-hour catch-up window opened from live TV.
+  final List<LiveChannel>? archivePlaylist;
+  final int? archiveIndex;
+  final DateTime? archiveWindowStartUtc;
 
   @override
   State<PlayerScreen> createState() => _PlayerScreenState();
@@ -208,8 +220,9 @@ class _PlayerScreenState extends State<PlayerScreen>
   final FocusNode _livePrevFocus = FocusNode(debugLabel: 'player-live-prev');
   final FocusNode _liveNextFocus = FocusNode(debugLabel: 'player-live-next');
   final FocusNode _liveSurfFocus = FocusNode(debugLabel: 'player-live-surf');
+  final FocusNode _liveArchiveFocus = FocusNode(debugLabel: 'player-live-archive');
   Set<FocusNode> get _liveBottomFocusNodes =>
-      {_livePrevFocus, _liveNextFocus, _liveSurfFocus};
+      {_livePrevFocus, _liveNextFocus, _liveSurfFocus, _liveArchiveFocus};
   final FocusScopeNode _surfScope = FocusScopeNode(debugLabel: 'player-surf');
 
   bool _showControls = true;
@@ -475,6 +488,97 @@ class _PlayerScreenState extends State<PlayerScreen>
   StreamSubscription<double>? _nativeAspectSub;
 
   bool get _isLive => widget.mode == PlaybackMode.live;
+  bool get _canArchive =>
+      _isLive &&
+      widget.source.isXtream &&
+      _pc.currentChannel?.tvArchive == true &&
+      _pc.currentChannel?.directUrl == null;
+
+  bool _openingArchive = false;
+  bool _returningToLive = false;
+
+  Future<void> _openArchive() async {
+    if (!_canArchive || _openingArchive) return;
+    final ch = _pc.currentChannel!;
+    final index = _pc.playingIndex;
+    _openingArchive = true;
+    try {
+      // Short EPG provides both a panel-local clock and a UTC epoch. This
+      // avoids assuming that the provider and the device share a time zone.
+      var entries = _epg[ch.id] ?? const <EpgEntry>[];
+      if (archiveClockOffset(entries) == null) {
+        try {
+          entries = await _appState.repository.shortEpg(widget.source, ch.id);
+        } catch (_) {
+          // Some panels expose XMLTV but not get_short_epg.
+        }
+      }
+      if (!mounted || _pc.currentChannel?.id != ch.id) return;
+      final now = DateTime.now().toUtc();
+      final end = DateTime.utc(now.year, now.month, now.day, now.hour, now.minute);
+      final start = end.subtract(const Duration(hours: 12));
+      var offset = archiveClockOffset(entries);
+      if (offset == null) {
+        try {
+          offset = await _appState.repository.archiveClockOffset(widget.source);
+        } catch (_) {
+          // Fall through to XMLTV when the panel omits server_info.
+        }
+      }
+      if (!mounted || _pc.currentChannel?.id != ch.id) return;
+      if (offset == null && ch.epgChannelId != null) {
+        final guide = await _appState.repository.loadGuide(widget.source);
+        if (!mounted || _pc.currentChannel?.id != ch.id) return;
+        offset = archiveGuideClockOffset(
+            guide[ch.epgChannelId!.toLowerCase().trim()] ?? const [], start);
+      }
+      if (offset == null) {
+        _snack('Kan ikke fastslå udbyderens arkivtid for denne kanal.');
+        return;
+      }
+      // Keep the URL's minute resolution aligned with the slider's origin.
+      final url = StreamUrlBuilder.timeshift(
+        widget.source, ch, 12 * 60, archiveStart(start, offset));
+      // Silence the outgoing live player before the replacement route opens a
+      // second connection (many Xtream accounts allow only one).
+      if (_useNative) await _nativeController?.stop();
+      await _pc.stopForNavigation();
+      if (!mounted) return;
+      Navigator.of(context).pushReplacement(MaterialPageRoute(
+        builder: (_) => PlayerScreen.onDemand(
+          source: widget.source,
+          url: url,
+          title: '${ch.name} · Arkiv',
+          durationHint: 12 * 60 * 60,
+          startAt: const Duration(hours: 11, minutes: 30),
+          archivePlaylist: widget.playlist,
+          archiveIndex: index,
+          archiveWindowStartUtc: start,
+        ),
+      ));
+    } catch (_) {
+      if (mounted) _snack('Kunne ikke åbne kanalens TV-arkiv.');
+    } finally {
+      _openingArchive = false;
+    }
+  }
+
+  Future<void> _returnToLive() async {
+    final playlist = widget.archivePlaylist;
+    final index = widget.archiveIndex;
+    if (playlist == null || index == null || !mounted || _returningToLive) return;
+    _returningToLive = true;
+    if (_useNative) await _nativeController?.stop();
+    await _pc.stopForNavigation();
+    if (!mounted) return;
+    Navigator.of(context).pushReplacement(MaterialPageRoute(
+      builder: (_) => PlayerScreen.live(
+        source: widget.source,
+        playlist: playlist,
+        initialIndex: index,
+      ),
+    ));
+  }
 
   /// TV box with the native-player toggle on — covers both live TV and
   /// on-demand movies/series, both routed through the same ExoPlayer +
@@ -542,7 +646,9 @@ class _PlayerScreenState extends State<PlayerScreen>
       // dispose(), where context lookups throw and would abort the player
       // teardown (leaving audio playing after the screen pops).
       _downloads = context.read<DownloadManager>();
-      _pc.onDemandCompleted = _onEpisodeCompleted;
+      _pc.onDemandCompleted = widget.archivePlaylist != null
+          ? () => unawaited(_returnToLive())
+          : _onEpisodeCompleted;
       _pc.openOnDemand(
         url: widget.url!,
         source: widget.source,
@@ -1111,6 +1217,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     _livePrevFocus.dispose();
     _liveNextFocus.dispose();
     _liveSurfFocus.dispose();
+    _liveArchiveFocus.dispose();
     _surfScope.dispose();
     _surfScroll?.dispose();
     _pc.dispose();
@@ -1976,20 +2083,47 @@ class _PlayerScreenState extends State<PlayerScreen>
   Widget _liveBottom() {
     return Padding(
       padding: const EdgeInsets.only(bottom: 14),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.center,
+      child: Wrap(
+        alignment: WrapAlignment.center,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        spacing: 16,
+        runSpacing: 8,
         children: [
           _circleBtn(Icons.skip_previous, _pc.prev, focusNode: _livePrevFocus),
-          const SizedBox(width: 20),
           Text('${_pc.index + 1} / ${_pc.playlist.length}',
               style: const TextStyle(color: Colors.white70)),
-          const SizedBox(width: 20),
           _circleBtn(Icons.skip_next, _pc.next, focusNode: _liveNextFocus),
-          const SizedBox(width: 20),
           _circleBtn(Icons.list, _openSurf, focusNode: _liveSurfFocus),
+          FocusRing(
+            borderRadius: 12,
+            child: _canArchive
+                ? FilledButton.icon(
+                    focusNode: _liveArchiveFocus,
+                    onPressed: _openArchive,
+                    icon: const Icon(Icons.history),
+                    label: const Text('Spol 12 timer'),
+                  )
+                : OutlinedButton.icon(
+                    focusNode: _liveArchiveFocus,
+                    onPressed: () => _snack(
+                      'Udbyderen tilbyder ikke TV-arkiv for denne kanal. '
+                      'Spoling kræver arkiv eller lokal optagelse.',
+                    ),
+                    icon: const Icon(Icons.history_toggle_off),
+                    label: const Text('Intet arkiv'),
+                  ),
+          ),
         ],
       ),
     );
+  }
+
+  String? _archiveClock(Duration position) {
+    final start = widget.archiveWindowStartUtc;
+    if (start == null) return null;
+    final local = start.add(position).toLocal();
+    String two(int n) => n.toString().padLeft(2, '0');
+    return '${two(local.hour)}:${two(local.minute)}';
   }
 
   Widget _onDemandBottom() {
@@ -2007,7 +2141,8 @@ class _PlayerScreenState extends State<PlayerScreen>
         children: [
           Row(
             children: [
-              Text(_fmt(pos), style: const TextStyle(color: Colors.white70)),
+              Text(_archiveClock(pos) ?? _fmt(pos),
+                  style: const TextStyle(color: Colors.white70)),
               Expanded(
                 child: FocusRing(
                   borderRadius: 10,
@@ -2049,7 +2184,8 @@ class _PlayerScreenState extends State<PlayerScreen>
                   ),
                 ),
               ),
-              Text(_fmt(dur), style: const TextStyle(color: Colors.white70)),
+              Text(_archiveClock(dur) ?? _fmt(dur),
+                  style: const TextStyle(color: Colors.white70)),
             ],
           ),
           Row(
@@ -2072,6 +2208,17 @@ class _PlayerScreenState extends State<PlayerScreen>
                   big: true, focusNode: _controlsFocus),
               const SizedBox(width: 16),
               _circleBtn(Icons.forward_10, () => _skip(1)),
+              if (widget.archivePlaylist != null) ...[
+                const SizedBox(width: 16),
+                FocusRing(
+                  borderRadius: 12,
+                  child: FilledButton.icon(
+                    onPressed: _returnToLive,
+                    icon: const Icon(Icons.live_tv),
+                    label: const Text('Live'),
+                  ),
+                ),
+              ],
               // Manually skip ahead mid-episode — previously the ONLY way to
               // advance was waiting for the episode to finish and the 10s
               // auto-next countdown to fire.

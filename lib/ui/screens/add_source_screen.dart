@@ -11,7 +11,8 @@ import '../widgets/tv_text_field.dart';
 import 'add_from_phone_screen.dart';
 
 /// Form for adding a new IPTV source — either an M3U playlist or an
-/// Xtream Codes account. Works with both touch and a D-pad remote.
+/// Xtream Codes account — and, with [existing] set, for editing one in place.
+/// Works with both touch and a D-pad remote.
 ///
 /// When [isFirstRun] is true the screen never pops on success; the root widget
 /// swaps to the main shell automatically once a source becomes active.
@@ -22,10 +23,22 @@ class AddSourceScreen extends StatefulWidget {
     super.key,
     this.isFirstRun = false,
     this.startInXtreamMode = false,
+    this.existing,
   });
 
   final bool isFirstRun;
   final bool startInXtreamMode;
+
+  /// When set, the form edits THIS source in place: same id, so favorites,
+  /// resume points, hidden categories and the custom category order all
+  /// survive the edit. Every field is pre-filled from the saved record and
+  /// NOTHING is masked — the password starts visible, because the point of
+  /// the screen is to read back and correct a login already stored on this
+  /// machine. (The eye toggle still hides it if someone is looking over your
+  /// shoulder.)
+  final IptvSource? existing;
+
+  bool get isEditing => existing != null;
 
   @override
   State<AddSourceScreen> createState() => _AddSourceScreenState();
@@ -39,10 +52,23 @@ class _AddSourceScreenState extends State<AddSourceScreen> {
   final _userCtrl = TextEditingController();
   final _passCtrl = TextEditingController();
 
-  late SourceType _type =
-      widget.startInXtreamMode ? SourceType.xtream : SourceType.m3u;
-  bool _obscurePassword = true;
+  late SourceType _type = widget.existing?.type ??
+      (widget.startInXtreamMode ? SourceType.xtream : SourceType.m3u);
+  late bool _obscurePassword = !widget.isEditing;
   bool _saving = false;
+
+  @override
+  void initState() {
+    super.initState();
+    final e = widget.existing;
+    if (e == null) return;
+    // Pre-fill everything verbatim, including the password.
+    _nameCtrl.text = e.name;
+    _urlCtrl.text = e.m3uUrl ?? '';
+    _hostCtrl.text = e.host ?? '';
+    _userCtrl.text = e.username ?? '';
+    _passCtrl.text = e.password ?? '';
+  }
 
   @override
   void dispose() {
@@ -77,11 +103,34 @@ class _AddSourceScreenState extends State<AddSourceScreen> {
     return null;
   }
 
+  /// Carry over the fields this form doesn't show (custom User-Agent,
+  /// referrer, external EPG URL, stream format) so editing a login never
+  /// silently drops settings the user configured elsewhere.
+  IptvSource _preserveAdvanced(IptvSource built, IptvSource? from) {
+    if (from == null) return built;
+    return IptvSource(
+      id: built.id,
+      name: built.name,
+      type: built.type,
+      m3uUrl: built.m3uUrl,
+      host: built.host,
+      username: built.username,
+      password: built.password,
+      userAgent: from.userAgent,
+      referrer: from.referrer,
+      epgUrl: from.epgUrl,
+      streamFormat: from.streamFormat,
+    );
+  }
+
   Future<void> _save() async {
     if (!(_formKey.currentState?.validate() ?? false)) return;
 
     setState(() => _saving = true);
-    final id = DateTime.now().microsecondsSinceEpoch.toString();
+    final editing = widget.existing;
+    // Keeping the id is what makes this an EDIT: everything persisted per
+    // source (favorites, resume, hidden categories, order) is keyed by it.
+    final id = editing?.id ?? DateTime.now().microsecondsSinceEpoch.toString();
     final name = _nameCtrl.text.trim();
 
     final IptvSource source;
@@ -98,7 +147,7 @@ class _AddSourceScreenState extends State<AddSourceScreen> {
       if (converted != null) {
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
           content: Text(
-              'Linket indeholder et Xtream-login — tilføjet som Xtream Codes '
+              'Linket indeholder et Xtream-login — gemt som Xtream Codes '
               '(giver også Film, Serier og Guide).'),
         ));
       }
@@ -119,6 +168,32 @@ class _AddSourceScreenState extends State<AddSourceScreen> {
     }
 
     final state = context.read<AppState>();
+    final messenger = ScaffoldMessenger.of(context);
+
+    if (editing != null) {
+      // Only the ACTIVE source gets reloaded by updateSource, so liveError is
+      // only about this edit when it IS the active one — otherwise it still
+      // describes whatever the active source last did.
+      final wasActive = state.active?.id == editing.id;
+      await state.updateSource(_preserveAdvanced(source, editing));
+      if (!mounted) return;
+      setState(() => _saving = false);
+      final error = wasActive ? state.liveError : null;
+      if (error != null) {
+        // Deliberately NOT rolled back, unlike the add path below: the user
+        // asked for exactly this login, and silently restoring the old one
+        // would throw away a correct edit whenever the provider happens to
+        // be down. Keep the change, show why it didn't connect, and stay on
+        // the form so a typo can be fixed on the spot.
+        messenger.showSnackBar(
+          SnackBar(content: Text('Gemt, men kunne ikke forbinde: $error')),
+        );
+        return;
+      }
+      Navigator.of(context).pop();
+      return;
+    }
+
     final previousActive = state.active;
     await state.addSource(source);
     if (!mounted) return;
@@ -151,7 +226,11 @@ class _AddSourceScreenState extends State<AddSourceScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(widget.isFirstRun ? 'Kom i gang' : 'Tilføj kilde'),
+        title: Text(widget.isEditing
+            ? 'Rediger kilde'
+            : widget.isFirstRun
+                ? 'Kom i gang'
+                : 'Tilføj kilde'),
       ),
       body: Center(
         child: ConstrainedBox(
@@ -164,7 +243,10 @@ class _AddSourceScreenState extends State<AddSourceScreen> {
                 child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  if (PairingServer.supported) ...[
+                  // Pairing creates a NEW source, so it has no place in the
+                  // edit form (and it would steal the initial focus from the
+                  // first field — see the name field's autofocus below).
+                  if (PairingServer.supported && !widget.isEditing) ...[
                     OutlinedButton.icon(
                       autofocus: true,
                       onPressed: _saving
@@ -223,6 +305,10 @@ class _AddSourceScreenState extends State<AddSourceScreen> {
                   const SizedBox(height: 24),
                   TvTextInput(
                     controller: _nameCtrl,
+                    // In edit mode this is the first control on screen (the
+                    // pairing button above is gone), so it takes the focus a
+                    // D-pad user would otherwise have to hunt for.
+                    autofocus: widget.isEditing,
                     builder: (context, node) => TextFormField(
                       controller: _nameCtrl,
                       focusNode: node,
@@ -327,8 +413,12 @@ class _AddSourceScreenState extends State<AddSourceScreen> {
                             height: 18,
                             child: CircularProgressIndicator(strokeWidth: 2),
                           )
-                        : const Icon(Icons.link),
-                    label: Text(_saving ? 'Forbinder…' : 'Gem og forbind'),
+                        : Icon(widget.isEditing ? Icons.save : Icons.link),
+                    label: Text(_saving
+                        ? 'Forbinder…'
+                        : widget.isEditing
+                            ? 'Gem ændringer'
+                            : 'Gem og forbind'),
                     style: FilledButton.styleFrom(
                       padding: const EdgeInsets.symmetric(vertical: 16),
                     ),

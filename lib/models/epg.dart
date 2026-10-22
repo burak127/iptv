@@ -4,12 +4,15 @@ class EpgEntry {
   final String? description;
   final DateTime startUtc;
   final DateTime endUtc;
+  /// Panel-local start clock, used to align Xtream timeshift URLs with UTC.
+  final String? serverStart;
 
   const EpgEntry({
     required this.title,
     this.description,
     required this.startUtc,
     required this.endUtc,
+    this.serverStart,
   });
 
   bool isLiveAt(DateTime nowUtc) =>
@@ -28,6 +31,7 @@ class EpgEntry {
         'description': description,
         'startUtc': startUtc.toUtc().toIso8601String(),
         'endUtc': endUtc.toUtc().toIso8601String(),
+        'serverStart': serverStart,
       };
 
   factory EpgEntry.fromJson(Map<String, dynamic> j) => EpgEntry(
@@ -35,5 +39,6 @@ class EpgEntry {
         description: j['description'] as String?,
         startUtc: DateTime.parse(j['startUtc'] as String).toUtc(),
         endUtc: DateTime.parse(j['endUtc'] as String).toUtc(),
+        serverStart: j['serverStart'] as String?,
       );
 }

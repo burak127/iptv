@@ -484,6 +484,16 @@ class PlaybackController extends ChangeNotifier {
     _player.pause();
   }
 
+  /// Release the outgoing stream before a replacement player route opens.
+  /// Pausing alone can keep a provider's single connection occupied.
+  Future<void> stopForNavigation() async {
+    if (_disposed) return;
+    _inBackground = true;
+    _reconnectTimer?.cancel();
+    _zapDebounce?.cancel();
+    if (!_externalVideo) await _player.stop();
+  }
+
   void onAppForeground() {
     if (_disposed) return;
     // Only act if we actually backgrounded. Expanding a PiP window back to
